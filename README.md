@@ -1,7 +1,8 @@
 ```markdown
 # 倒计时桌面 · 多功能桌面悬浮倒计时工具
-exe可执行文件下载地址:https://1823222148.share.123pan.cn/123pan/tM3gjv-9rwJA
 
+**安装程序下载地址:https://1823222148.share.123pan.cn/123pan/tM3gjv-9rwJA**
+旧版下载地址：https://1823222148.share.123pan.cn/123pan/tM3gjv-SFGwA
 
 ## 一、软件简介
 
