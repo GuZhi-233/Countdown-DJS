@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2026 GuZhi
+# Copyright (c) 2026 苗睿轩
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -49,11 +49,11 @@ import getpass
 import requests
 from PyQt6.QtCore import (Qt, QTimer, QThread, pyqtSignal, QObject, QPoint, QRect,
                           QPropertyAnimation, QEasingCurve, QRectF, QPointF, QByteArray,
-                          pyqtProperty, QSize)
+                          pyqtProperty, QSize, QEvent, QDate, qVersion, PYQT_VERSION_STR)
 from PyQt6.QtGui import (QColor, QFont, QPainter, QPainterPath, QPixmap, QImage,
                          QIcon, QAction, QPen, QBrush, QPalette, QLinearGradient,
                          QFontDatabase, QMovie, QFontMetrics, QTextLayout, QTextOption, QTextCursor,
-                         QCursor)
+                         QCursor, QTextCharFormat)
 from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QPushButton,
                              QVBoxLayout, QHBoxLayout, QGraphicsDropShadowEffect,
                              QSystemTrayIcon, QMenu, QMessageBox, QFileDialog,
@@ -64,7 +64,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QPushButton,
                              QListWidget, QListWidgetItem, QFormLayout,
                              QDoubleSpinBox, QGraphicsOpacityEffect, QSizeGrip,
                              QProgressBar, QSizePolicy, QTextEdit,
-                             QFrame, QStackedWidget, QSplitter)
+                             QFrame, QStackedWidget, QSplitter, QCalendarWidget)
 
 
 PROVINCE_CITY_DATA = {
@@ -187,12 +187,24 @@ def get_theme_qss(t):
     QPushButton:hover {{
         background-color: {c['hover_accent']}; color: {c['hover_btn_text']};
     }}
+    QPushButton[primary="true"] {{
+        background-color: {c['accent']}; color: {c['btn_text']};
+    }}
+    QPushButton[primary="true"]:hover {{
+        background-color: {c['hover_accent']}; color: {c['hover_btn_text']};
+    }}
     QPushButton[secondary="true"] {{
         background: transparent; color: {c['text_color']};
         border: 1px solid {c['border_color']};
     }}
     QPushButton[secondary="true"]:hover {{
         border-color: {c['accent']}; color: {c['accent']};
+    }}
+    QPushButton[danger="true"] {{
+        background-color: {c['danger']}; color: #FFFFFF;
+    }}
+    QPushButton[danger="true"]:hover {{
+        background-color: #c0392b; color: #FFFFFF;
     }}
     QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
         background-color: {c['input_bg']}; border: 1px solid {c['border_color']};
@@ -303,8 +315,14 @@ _lang_data = {}
 def tr(key):
     return _lang_data.get(CURRENT_LANG, {}).get(key, key)
 
+_console_log_callback = None
+
+def set_console_log_callback(callback):
+    global _console_log_callback
+    _console_log_callback = callback
+
 def log_message(message, level="INFO", stack_level=1):
-    global DEBUG_MODE, LOG_FILE
+    global DEBUG_MODE, LOG_FILE, _console_log_callback
     level_map = {"ERROR": 1, "WARNING": 1, "INFO": 2, "DEBUG": 3}
     msg_level = level_map.get(level, 2)
     if DEBUG_MODE < msg_level:
@@ -336,6 +354,11 @@ def log_message(message, level="INFO", stack_level=1):
         f.write(f"[{timestamp}] [{level}] [{caller}] {message}\n")
     if DEBUG_MODE >= 3:
         debug_print(f"[{timestamp}] [{level}] [{caller}] {message}")
+    if _console_log_callback:
+        try:
+            _console_log_callback(message, level, timestamp)
+        except Exception:
+            pass
 
 def hide_console():
     if sys.platform == "win32" and hasattr(sys, 'frozen'):
@@ -401,19 +424,19 @@ def calculate_days(target_date, target_time="00:00"):
                     if on_holiday and i == 0:
                         holiday_name = name
 
-            if chinese_calendar.is_workday(today.date()):
-                now_time = today.hour * 3600 + today.minute * 60 + today.second
-                work_start = 9 * 3600
-                work_end = 18 * 3600
-                if now_time < work_start:
-                    remaining_today = work_end - work_start
-                elif now_time > work_end:
-                    remaining_today = 0.0
-                else:
-                    remaining_today = work_end - now_time
-                work_seconds = work_days * 8 * 3600 + remaining_today
+        if chinese_calendar.is_workday(today.date()):
+            now_time = today.hour * 3600 + today.minute * 60 + today.second
+            work_start = 9 * 3600
+            work_end = 18 * 3600
+            if now_time < work_start:
+                remaining_today = work_end - work_start
+            elif now_time > work_end:
+                remaining_today = 0.0
             else:
-                work_seconds = work_days * 8 * 3600
+                remaining_today = work_end - now_time
+            work_seconds = work_days * 8 * 3600 + remaining_today
+        else:
+            work_seconds = work_days * 8 * 3600
 
         work_days_float = work_seconds / (8 * 3600)
 
@@ -463,6 +486,11 @@ class RollingNumberLabel(QWidget):
         self._current_str = "0.000"
         self._target_str = "0.000"
         self._unit = " 天"
+        self._expired = False
+        self._expired_text = "已到期"
+        self._display_format = "decimal"
+        self._display_format_template = "{days}天 {hours}时 {minutes}分"
+        self._raw_days = 0.0
         self.use_neon = True
         self.gradient_start = QColor("#00f2fe")
         self.gradient_end = QColor("#4facfe")
@@ -491,11 +519,61 @@ class RollingNumberLabel(QWidget):
         self._anim_progress = val
         self.update()
 
+    def set_display_format(self, fmt, template="{days}天 {hours}时 {minutes}分"):
+        self._display_format = fmt
+        self._display_format_template = template
+        if not self._expired and self._raw_days > 0:
+            self._apply_format_and_update()
+
+    def _format_value(self, days_float):
+        if self._display_format == "decimal":
+            return f"{days_float:.3f}", " 天"
+        elif self._display_format == "integer":
+            return str(int(days_float)), " 天"
+        elif self._display_format == "hms":
+            total_seconds = days_float * 86400
+            d = int(total_seconds // 86400)
+            h = int((total_seconds % 86400) // 3600)
+            m = int((total_seconds % 3600) // 60)
+            if d > 0:
+                return f"{d}天 {h}时 {m}分", ""
+            else:
+                return f"{h}时 {m}分", ""
+        elif self._display_format == "custom":
+            total_seconds = days_float * 86400
+            d = int(total_seconds // 86400)
+            h = int((total_seconds % 86400) // 3600)
+            m = int((total_seconds % 3600) // 60)
+            s = int(total_seconds % 60)
+            try:
+                text = self._display_format_template.format(days=d, hours=h, minutes=m, seconds=s)
+            except (KeyError, ValueError):
+                text = f"{d}天 {h}时 {m}分"
+            return text, ""
+        return f"{days_float:.3f}", " 天"
+
+    def _apply_format_and_update(self):
+        target_str, unit = self._format_value(self._raw_days)
+        self._target_str = target_str
+        self._current_str = target_str
+        self._unit = unit
+        self._anim_progress = 1.0
+        self.update()
+
     def setValue(self, new_value: float):
         if abs(new_value - self._target_value) < 1e-6:
             return
+        if self._expired and new_value <= 0:
+            return
+        if new_value <= 0:
+            self.showExpired()
+            self.value_changed.emit(new_value)
+            return
+        self._expired = False
         self._target_value = new_value
-        target_str = f"{new_value:.3f}"
+        self._raw_days = new_value
+        target_str, unit = self._format_value(new_value)
+        self._unit = unit
         if target_str == self._target_str:
             return
         if self._anim.state() == QPropertyAnimation.State.Running:
@@ -518,10 +596,49 @@ class RollingNumberLabel(QWidget):
         self._anim_progress = 1.0
         self.update()
 
+    def showExpired(self, text=None):
+        if text is not None:
+            self._expired_text = text
+        display = self._expired_text if self._expired_text else "0.000"
+        self._expired = True
+        self._target_str = display
+        self._current_str = display
+        self._unit = "" if self._expired_text else " 天"
+        self._target_value = 0.0
+        self._anim_progress = 1.0
+        self.setToolTip("此项目倒计时已到期")
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setFont(self.font())
+
+        if self._expired:
+            display_text = self._target_str
+            fm = QFontMetrics(self.font())
+            text_width = fm.horizontalAdvance(display_text)
+            text_height = fm.height()
+            x = (self.width() - text_width) // 2
+            y = (self.height() - text_height) // 2 + fm.ascent()
+
+            # 效果
+            if self.use_neon:
+                pulse = (math.sin(self._pulse_phase) + 1.0) / 2.0
+                glow = QColor(243, 139, 168, int(40 + pulse * 30))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(glow)
+                painter.drawRoundedRect(QRectF(self.rect().adjusted(4, 4, -4, -4)), 10, 10)
+
+            grad = QLinearGradient(0, 0, self.width(), 0)
+            grad.setColorAt(0.0, QColor("#f38ba8"))
+            grad.setColorAt(1.0, QColor("#e06c75"))
+            pen = QPen()
+            pen.setBrush(QBrush(grad))
+            painter.setPen(pen)
+            painter.setFont(QFont(self.font().family(), self.font().pixelSize(), QFont.Weight.Bold))
+            painter.drawText(int(x), int(y), display_text)
+            return
 
         if self.use_neon:
             pulse = (math.sin(self._pulse_phase) + 1.0) / 2.0
@@ -845,7 +962,6 @@ class TypewriterLabel(QWidget):
 
                 if self._char_index <= line_end or i == layout.lineCount() - 1:
                     cursor_in_line = max(0, min(self._char_index - line_start, line_len))
-                    # PyQt6: cursorToX 返回 float
                     result = line.cursorToX(cursor_in_line)
                     cursor_x = result[0] if isinstance(result, (tuple, list)) else result
                     cursor_y = line.position().y()
@@ -868,7 +984,7 @@ class TypewriterLabel(QWidget):
 
         painter.end()
 
-# 天气 ( Open-Meteo )
+# 天气
 WEATHER_CODE_MAP = {
     0: "晴", 1: "大部晴朗", 2: "多云", 3: "阴天",
     45: "雾", 48: "沉积雾凇的雾",
@@ -880,7 +996,6 @@ WEATHER_CODE_MAP = {
 }
 
 class WeatherForecastDialog(QDialog):
-    """显示近几天天气预报的弹出窗口"""
     def __init__(self, lat, lon, city_name, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"📅 {city_name} 未来天气预报")
@@ -939,7 +1054,6 @@ class WeatherForecastDialog(QDialog):
             self.label_title.setText("无数据")
             return
         self.label_title.setText(f"{self.city} 未来天气")
-        # 清除旧内容
         while self.content_layout.count():
             child = self.content_layout.takeAt(0)
             if child.widget():
@@ -986,7 +1100,6 @@ class WeatherFetcher(QObject):
         threading.Thread(target=run, daemon=True).start()
 
     def _fetch_wttr(self, headers, city_name):
-        """国内可用的免费API：wttr.in"""
         try:
             city = city_name if city_name else "Beijing"
             # format=%C+%t 表示：天气描述+温度，lang=zh 中文
@@ -1002,7 +1115,6 @@ class WeatherFetcher(QObject):
             self._fetch_open_meteo(headers, city_name)
 
     def _fetch_custom(self, headers, city_name):
-        """用户自定义API模板"""
         try:
             url = self.custom_url_template.replace("{city}", urllib.parse.quote(city_name))
             resp = requests.get(url, timeout=6, headers=headers)
@@ -1015,7 +1127,6 @@ class WeatherFetcher(QObject):
             self.weather_updated.emit("🌤️ 自定义API离线")
 
     def _fetch_open_meteo(self, headers, city_name):
-        """原版 Open-Meteo (国内可能超时)"""
         try:
             lat, lon, name = None, None, ""
             if city_name:
@@ -1152,8 +1263,8 @@ import sys
 import os
 import json
 
-# 必须在类外定义此线程局部变量
 _plugin_context = threading.local()
+_audit_guard = threading.local()
 
 class PluginManager(QObject):
     def __init__(self, app, load_immediately=False):
@@ -1168,6 +1279,7 @@ class PluginManager(QObject):
         self.signature_required = False
         self.public_key = None
         self._audit_hook_installed = False
+        self._audit_suppress = False
         self.load_security_config()
         if load_immediately:
             self.load_plugins()
@@ -1208,24 +1320,131 @@ class PluginManager(QObject):
     def _install_audit_hook(self):
         if self._audit_hook_installed:
             return
+        manager = self
+        plugin_dir_abs = os.path.normcase(os.path.abspath(self.plugin_dir))
+        data_dir_abs = os.path.normcase(os.path.abspath(self.app.data_dir))
+
+        def _find_plugin_from_stack():
+            try:
+                frame = sys._getframe(2)
+                depth = 0
+                while frame is not None and depth < 60:
+                    fname = frame.f_code.co_filename
+                    if fname and not fname.startswith('<'):
+                        fpath = os.path.normcase(os.path.abspath(fname))
+                        if fpath.startswith(plugin_dir_abs + os.sep):
+                            base = os.path.basename(fpath)
+                            for p in manager.plugins:
+                                if p.filename == base:
+                                    return p
+                            return None
+                    frame = frame.f_back
+                    depth += 1
+            except Exception:
+                pass
+            return None
+
+        def _is_app_internal_file(path):
+            try:
+                p = os.path.normcase(os.path.abspath(str(path)))
+                if not p.startswith(data_dir_abs + os.sep):
+                    return False
+                frame = sys._getframe(2)
+                if frame:
+                    fname = frame.f_code.co_filename
+                    if fname and not fname.startswith('<'):
+                        fpath = os.path.normcase(os.path.abspath(fname))
+                        if fpath.startswith(plugin_dir_abs + os.sep):
+                            return False
+                return True
+            except Exception:
+                return False
+
         def audit_hook(event, args):
-            plugin = getattr(_plugin_context, 'current_plugin', None)
-            if not plugin:
+            if getattr(_audit_guard, 'active', False):
                 return
-            if event in ('os.system', 'subprocess.Popen', 'subprocess.call', 'exec', 'eval', 'open'):
-                if not plugin.permissions & PluginPermission.COMMAND:
-                    raise PermissionError(f"插件 '{plugin.name}' 无权限执行命令或访问文件")
+            if manager._audit_suppress:
+                return
+            if event not in ('open', 'os.system', 'subprocess.Popen', 'subprocess.call',
+                             'exec', 'eval', 'urllib.Request', 'socket.connect',
+                             'socket.getaddrinfo', 'os.remove', 'os.unlink',
+                             'os.rmdir', 'os.rename'):
+                return
+            if not manager.plugins:
+                return
+            plugin = getattr(_plugin_context, 'current_plugin', None)
+            if plugin is None:
+                plugin = _find_plugin_from_stack()
+            if plugin is None:
+                return
+            disabled = manager.app.global_disable_all_plugins or not plugin.enabled
+
+            def _record(text):
+                _audit_guard.active = True
+                try:
+                    manager.app.append_sensitive_log(plugin.name, text,
+                                                     str(args[0])[:120] if args else "")
+                except Exception:
+                    pass
+                finally:
+                    _audit_guard.active = False
+
+            def _deny(reason):
+                _audit_guard.active = True
+                try:
+                    manager.app.append_sensitive_log(
+                        plugin.name, f"[已拦截] {event}",
+                        (str(args[0])[:120] if args else "") + f" ({reason})")
+                    plugin.log_plugin(f"敏感操作被拦截: {event} ({reason})", "WARNING")
+                except Exception:
+                    pass
+                finally:
+                    _audit_guard.active = False
+                raise PermissionError(f"插件 '{plugin.name}' {reason}")
+
             if event == 'open':
+                path = args[0] if len(args) > 0 else ''
+                if _is_app_internal_file(path):
+                    return
                 mode = args[1] if len(args) > 1 else 'r'
-                if 'w' in mode or 'a' in mode:
+                if isinstance(mode, int):
+                    write_mode = bool(mode & (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC))
+                else:
+                    write_mode = any(c in str(mode) for c in ('w', 'a', '+', 'x'))
+                if disabled:
+                    _deny("插件处于禁用状态，禁止文件访问")
+                if write_mode:
                     if not plugin.permissions & PluginPermission.FILE_WRITE:
-                        raise PermissionError(f"插件 '{plugin.name}' 无写入文件权限")
+                        _deny("无写入文件权限")
                 else:
                     if not plugin.permissions & PluginPermission.FILE_READ:
-                        raise PermissionError(f"插件 '{plugin.name}' 无读取文件权限")
-            if event == 'urllib.Request':
+                        _deny("无读取文件权限")
+                _record(f"{event} mode={mode}")
+                return
+            if event in ('os.remove', 'os.unlink', 'os.rmdir', 'os.rename'):
+                if args and _is_app_internal_file(args[0]):
+                    return
+                if disabled:
+                    _deny("插件处于禁用状态，禁止删除/移动文件")
+                if not plugin.permissions & PluginPermission.FILE_WRITE:
+                    _deny("无写入文件权限")
+                _record(event)
+                return
+            if event in ('os.system', 'subprocess.Popen', 'subprocess.call', 'exec', 'eval'):
+                if disabled:
+                    _deny("插件处于禁用状态，禁止执行命令")
+                if not plugin.permissions & PluginPermission.COMMAND:
+                    _deny("无执行系统命令权限")
+                _record(event)
+                return
+            if event in ('urllib.Request', 'socket.connect', 'socket.getaddrinfo'):
+                if disabled:
+                    _deny("插件处于禁用状态，禁止网络访问")
                 if not plugin.permissions & PluginPermission.NETWORK:
-                    raise PermissionError(f"插件 '{plugin.name}' 无网络权限")
+                    _deny("无网络权限")
+                _record(event)
+                return
+
         sys.addaudithook(audit_hook)
         self._audit_hook_installed = True
 
@@ -1237,6 +1456,7 @@ class PluginManager(QObject):
         self._install_audit_hook()
 
         self.plugins.clear()
+        self._audit_suppress = True
         sys.path.insert(0, self.plugin_dir)
         for filename in sorted(os.listdir(self.plugin_dir)):
             if filename.endswith(".py") and not filename.startswith("_"):
@@ -1283,6 +1503,34 @@ class PluginManager(QObject):
                         'RuntimeError': RuntimeError,
                         'StopIteration': StopIteration,
                         'NotImplementedError': NotImplementedError,
+                        'OSError': OSError,
+                        'IOError': IOError,
+                        'PermissionError': PermissionError,
+                        'FileNotFoundError': FileNotFoundError,
+                        'FileExistsError': FileExistsError,
+                        'IsADirectoryError': IsADirectoryError,
+                        'NotADirectoryError': NotADirectoryError,
+                        'TimeoutError': TimeoutError,
+                        'ConnectionError': ConnectionError,
+                        'ZeroDivisionError': ZeroDivisionError,
+                        'ArithmeticError': ArithmeticError,
+                        'OverflowError': OverflowError,
+                        'LookupError': LookupError,
+                        'UnicodeError': UnicodeError,
+                        'UnicodeDecodeError': UnicodeDecodeError,
+                        'UnicodeEncodeError': UnicodeEncodeError,
+                        'BlockingIOError': BlockingIOError,
+                        'InterruptedError': InterruptedError,
+                        'ProcessLookupError': ProcessLookupError,
+                        'RecursionError': RecursionError,
+                        'SystemError': SystemError,
+                        'NameError': NameError,
+                        'UnboundLocalError': UnboundLocalError,
+                        'AssertionError': AssertionError,
+                        'MemoryError': MemoryError,
+                        'BufferError': BufferError,
+                        'Warning': Warning,
+                        'BaseException': BaseException,
                         'isinstance': isinstance,
                         'hasattr': hasattr,
                         'getattr': getattr,
@@ -1353,6 +1601,7 @@ class PluginManager(QObject):
                     log_message(f"[插件] {filename} 加载失败: {e}", "ERROR")
                     log_message(f"[插件] 完整堆栈:\n{tb}", "ERROR")
         sys.path.pop(0)
+        self._audit_suppress = False
         self.save_security_config()
 
     def _verify_signature(self, plugin_path):
@@ -1381,6 +1630,8 @@ class PluginManager(QObject):
         if self.app.global_disable_all_plugins and not force:
             log_message("全局插件已禁用，无法启用", "WARNING")
             return
+        if plugin.enabled and not force:
+            return
         if not force and not plugin.trusted:
             perms = plugin.requested_permissions
             if perms != PluginPermission.NONE:
@@ -1389,12 +1640,17 @@ class PluginManager(QObject):
                 if perms & PluginPermission.FILE_WRITE: msg += "  - 写入文件\n"
                 if perms & PluginPermission.NETWORK: msg += "  - 网络访问\n"
                 if perms & PluginPermission.COMMAND: msg += "  - 执行系统命令\n"
-                msg += "\n是否允许？"
+                msg += "\n是否授予这些权限？\n（拒绝后插件仍会启用，但无对应权限）"
                 reply = QMessageBox.question(None, "权限请求", msg,
                                             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                if reply == QMessageBox.StandardButton.No:
-                    return
-            plugin.permissions = perms
+                if reply == QMessageBox.StandardButton.Yes:
+                    plugin.permissions = perms
+                else:
+                    plugin.permissions = PluginPermission.NONE
+            else:
+                plugin.permissions = PluginPermission.NONE
+        elif not force and plugin.trusted:
+            plugin.permissions = plugin.requested_permissions
         plugin.enabled = True
         plugin.limited = limited
         _plugin_context.current_plugin = plugin
@@ -1405,17 +1661,21 @@ class PluginManager(QObject):
                 plugin.log_plugin(f"启用失败: {e}", "ERROR")
         _plugin_context.current_plugin = None
         self.save_security_config()
-        self.app.save_config()
+        self.app.save_config(force=True)
 
     def disable_plugin(self, plugin):
+        if not plugin.enabled:
+            return
         plugin.enabled = False
+        _plugin_context.current_plugin = plugin
         if hasattr(plugin, 'on_disable'):
             try:
                 plugin.on_disable()
             except Exception as e:
                 plugin.log_plugin(f"禁用失败: {e}", "ERROR")
+        _plugin_context.current_plugin = None
         self.save_security_config()
-        self.app.save_config()
+        self.app.save_config(force=True)
 
     def get_enabled_plugins(self):
         return [p for p in self.plugins if p.enabled]
@@ -1439,7 +1699,7 @@ class PluginManager(QObject):
     def set_plugin_permissions(self, plugin, perms):
         plugin.permissions = perms
         self.save_security_config()
-        self.app.save_config()
+        self.app.save_config(force=True)
 
 class Plugin:
     def __init__(self):
@@ -1531,7 +1791,6 @@ class Theme:
 
 
 def get_theme_colors(theme):
-    """Return a complete color dictionary based on theme dark/light mode."""
     if theme.is_dark:
         return {
             "accent": "#4FC3F7",
@@ -1568,7 +1827,7 @@ def get_theme_colors(theme):
             "hover_accent": "#106EBE",
             "panel_bg": "#F3F3F3",
             "input_bg": "#FFFFFF",
-            "text_color": "#1E1E1E",
+            "text_color": "#1D1D1F",
             "secondary_text": "#555555",
             "border_color": "#CCCCCC",
             "dark_bg": "#FFFFFF",
@@ -1622,7 +1881,8 @@ class CountdownProject:
                  weather_city="",
                  gradient_start=None, gradient_end=None,
                  dynamic_bg_type="particles", dynamic_fps=30, dynamic_quality="high",
-                 typewriter_interval=15, tip_interval=15):
+                 typewriter_interval=15, tip_interval=15, expired_text="已到期",
+                 display_format="decimal", display_format_template="{days}天 {hours}时 {minutes}分"):
         self.project_type = project_type
         self.pomodoro_work = pomodoro_work
         self.pomodoro_break = pomodoro_break
@@ -1637,6 +1897,9 @@ class CountdownProject:
         self.weather_city = weather_city
         self.typewriter_interval = typewriter_interval
         self.tip_interval = tip_interval
+        self.expired_text = expired_text
+        self.display_format = display_format
+        self.display_format_template = display_format_template
         if gradient_start is None:
             gradient_start = "#0a0a1a" if is_system_dark() else "#e0eaf5"
         if gradient_end is None:
@@ -1703,7 +1966,10 @@ class CountdownProject:
             "dynamic_fps": self.dynamic_fps,
             "dynamic_quality": self.dynamic_quality,
             "typewriter_interval": self.typewriter_interval,
-            "tip_interval": self.tip_interval
+            "tip_interval": self.tip_interval,
+            "expired_text": self.expired_text,
+            "display_format": self.display_format,
+            "display_format_template": self.display_format_template
         }
 
     @staticmethod
@@ -1743,7 +2009,10 @@ class CountdownProject:
             data.get("dynamic_fps", 30),
             data.get("dynamic_quality", "high"),
             data.get("typewriter_interval", 15),
-            data.get("tip_interval", 15)
+            data.get("tip_interval", 15),
+            data.get("expired_text", "已到期"),
+            data.get("display_format", "decimal"),
+            data.get("display_format_template", "{days}天 {hours}时 {minutes}分")
         )
 
 TIPS_DATA = [
@@ -2238,7 +2507,6 @@ class CountdownWindow(QWidget):
         self.enable_parallax = True
         self.parallax_intensity = 6
         self._base_positions = {}  # elem_id -> (base_x, base_y)
-        # 视差深度系数：越靠近前景（y值越大）移动幅度越大，产生纵深感
         self._parallax_depth = {
             "name": 0.3, "static_text": 0.4, "countdown": 0.7,
             "weather": 0.5, "pomodoro": 0.5, "tip": 0.9, "poem": 0.8
@@ -2248,7 +2516,6 @@ class CountdownWindow(QWidget):
         self.parallax_timer.timeout.connect(self.update_parallax)
         self.parallax_timer.start(16)
 
-        # 缓存控件尺寸，用于视差移动时跳过 adjustSize
         self._widget_sizes = {}
         self._last_window_size = (self.width(), self.height())
 
@@ -2281,7 +2548,7 @@ class CountdownWindow(QWidget):
             QTimer.singleShot(100, self.load_background_image)
 
         self.update_countdown()
-        self.apply_custom_layout(skip_style=False)  # 完整布局
+        self.apply_custom_layout(skip_style=False)
         self.master.plugin_manager.trigger_event("on_window_create", self, project)
 
     def _init_default_layout(self):
@@ -2352,7 +2619,9 @@ class CountdownWindow(QWidget):
         self.weather_label.setGraphicsEffect(QGraphicsDropShadowEffect(self))
         self.weather_label.mousePressEvent = self.show_weather_forecast
 
-        self.weather_fetcher = WeatherFetcher(api_provider="wttr_in")
+        self.weather_fetcher = WeatherFetcher(
+            api_provider=getattr(self.master, 'weather_provider', 'wttr_in'),
+            custom_url_template=getattr(self.master, 'custom_weather_url', ''))
         self.weather_fetcher.weather_updated.connect(self.weather_label.setText)
         self.weather_fetcher.weather_updated.connect(lambda _: self.apply_custom_layout(skip_style=False))
         self.weather_label.setVisible(False)
@@ -2425,6 +2694,9 @@ class CountdownWindow(QWidget):
         self.countdown_label.setFont(make_font(self.project.font_size, bold=True))
         self.countdown_label.set_neon_config(self.project.use_neon, self.project.neon_start,
                                              self.project.neon_end, self.project.neon_glow, self.project.font_color)
+        self.countdown_label.set_display_format(
+            getattr(self.project, 'display_format', 'decimal'),
+            getattr(self.project, 'display_format_template', '{days}天 {hours}时 {minutes}分'))
         self.poem_label.setFont(make_font(10))
         self.poem_label.setStyleSheet(f"color: {self.project.font_color};")
         self.weather_label.setFont(make_font(10, bold=True))
@@ -2697,7 +2969,6 @@ class CountdownWindow(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._last_window_size = (self.width(), self.height())
-        # 窗口大小变化时，必须完整刷新布局
         self.apply_custom_layout(skip_style=False)
         if self.project.background_type == "image":
             if not hasattr(self, 'bg_update_timer'):
@@ -2811,11 +3082,10 @@ class CountdownWindow(QWidget):
                 if isinstance(w, QLabel):
                     w.setAlignment(h | v)
 
-            # 获取尺寸（优先缓存）
+            # 获取尺寸
             if skip_style and elem_id in self._widget_sizes:
                 cw, ch = self._widget_sizes[elem_id]
             else:
-                # 优先使用自定义尺寸
                 custom_w = cfg.get("custom_width")
                 custom_h = cfg.get("custom_height")
                 if custom_w is not None and custom_h is not None:
@@ -2831,9 +3101,7 @@ class CountdownWindow(QWidget):
             pct_x = cfg.get("x", 0.5)
             pct_y = cfg.get("y", 0.5)
 
-            # 针对 TypewriterLabel（诗语和小提示）自动调整宽高并居中
             if isinstance(w, TypewriterLabel):
-                # 移除可能干扰自定义绘制的 QGraphicsOpacityEffect
                 if isinstance(w.graphicsEffect(), QGraphicsOpacityEffect):
                     w.setGraphicsEffect(None)
                 if not skip_style:
@@ -2892,17 +3160,14 @@ class CountdownWindow(QWidget):
             widget.setText("🖼️ 无图片")
             return widget
 
-        # 尝试多种路径解析
         full_path = None
         if os.path.isabs(image_path) and os.path.exists(image_path):
             full_path = image_path
         else:
-            # 尝试相对路径：data/user/文件名
             if hasattr(self.master, 'user_dir') and self.master.user_dir:
                 candidate = os.path.join(self.master.user_dir, image_path)
                 if os.path.exists(candidate):
                     full_path = candidate
-            # 如果还找不到，尝试 data 根目录
             if not full_path:
                 data_dir = resource_path("data")
                 candidate = os.path.join(data_dir, image_path)
@@ -2916,7 +3181,7 @@ class CountdownWindow(QWidget):
                     widget.setMovie(movie)
                     movie.start()
                     widget._movie = movie
-                widget.setText("")  # 清除文本
+                widget.setText("")
             else:
                 pixmap = QPixmap(full_path)
                 if not pixmap.isNull():
@@ -3021,9 +3286,12 @@ class CountdownWindow(QWidget):
             diff = target - now
             total_seconds = diff.total_seconds()
             if total_seconds <= 0:
-                self.countdown_label.setValue(0.0)
+                self.expired = True
+                if not self.countdown_label._expired:
+                    self.countdown_label.showExpired(self.project.expired_text)
                 return
             natural_days = total_seconds / 86400.0
+            self.expired = False
             self.countdown_label.setValue(natural_days)
         except Exception as e:
             log_message(f"update_ticking_countdown 错误: {e}", "ERROR")
@@ -3032,6 +3300,24 @@ class CountdownWindow(QWidget):
         layout = self.project.custom_layout
         show_poem = layout.get("poem", {}).get("visible", False)
         if show_poem:
+            if not self.master.poems_data or all(len(v) == 0 for v in self.master.poems_data.values()):
+                # 数据未就绪，延迟重试
+                QTimer.singleShot(3000, self._retry_poem_load)
+                self.poem_label._full_text = "诗语数据加载中...请稍候"
+                self.poem_label._current_display = "诗语数据加载中..."
+                self.poem_label.update()
+                return
+            text = self.master.get_random_poem_or_tip()
+            if not text or text.strip() == "":
+                text = "诗语轻扬 — 请检查诗词数据文件"
+            self.poem_label.start_animation(text)
+
+    def _retry_poem_load(self):
+        if not self.master.poems_data or all(len(v) == 0 for v in self.master.poems_data.values()):
+            self.poem_label._full_text = "诗词数据未加载\n请重启应用或在设置中检查诗词级别"
+            self.poem_label._current_display = "诗词数据未加载 - 请重启应用"
+            self.poem_label.update()
+        else:
             text = self.master.get_random_poem_or_tip()
             self.poem_label.start_animation(text)
 
@@ -3039,6 +3325,23 @@ class CountdownWindow(QWidget):
         layout = self.project.custom_layout
         show_tip = layout.get("tip", {}).get("visible", False)
         if show_tip:
+            if not TIPS_DATA or len(TIPS_DATA) == 0:
+                QTimer.singleShot(3000, self._retry_tip_load)
+                self.tip_hint_widget._full_text = "小提示数据加载中...请稍候"
+                self.tip_hint_widget._current_display = "小提示数据加载中..."
+                self.tip_hint_widget.update()
+                return
+            text = random.choice(TIPS_DATA)
+            if not text or text.strip() == "":
+                text = "💡 欢迎使用倒计时桌面！"
+            self.tip_hint_widget.start_animation(text)
+
+    def _retry_tip_load(self):
+        if not TIPS_DATA or len(TIPS_DATA) == 0:
+            self.tip_hint_widget._full_text = "小提示数据未加载\n请重启应用"
+            self.tip_hint_widget._current_display = "小提示数据未加载 - 请重启应用"
+            self.tip_hint_widget.update()
+        else:
             text = random.choice(TIPS_DATA)
             self.tip_hint_widget.start_animation(text)
 
@@ -3189,7 +3492,6 @@ class FluentToggleSwitch(QWidget):
 
 
 class CollapsibleSection(QWidget):
-    """可折叠面板"""
     def __init__(self, title="", parent=None, initially_expanded=True):
         super().__init__(parent)
         self.expanded = initially_expanded
@@ -3327,7 +3629,6 @@ class PreviewCanvas(QWidget):
         canvas_rect = self._get_canvas_rect()
         scale = canvas_rect.width() / self.project.size[0] if self.project.size[0] > 0 else canvas_rect.width() / 600.0
 
-        # Use custom size if available
         custom_w = config.get("custom_width")
         custom_h = config.get("custom_height")
         if custom_w is not None and custom_h is not None:
@@ -3376,7 +3677,6 @@ class PreviewCanvas(QWidget):
         return texts.get(elem_id, elem_id)
 
     def _get_handle_positions(self, rect):
-        """Return 8 handle positions: TL, TC, TR, ML, MR, BL, BC, BR"""
         return {
             "tl": QPoint(rect.left(), rect.top()),
             "tc": QPoint(rect.center().x(), rect.top()),
@@ -3389,7 +3689,6 @@ class PreviewCanvas(QWidget):
         }
 
     def _hit_test_handle(self, pos, elem_id):
-        """Check if pos hits a resize handle for the highlighted element"""
         if elem_id != self.highlighted_elem:
             return None
         config = (self.project.custom_layout or {}).get(elem_id, {})
@@ -3505,18 +3804,17 @@ class PreviewCanvas(QWidget):
                                         config.get("bg_radius", 0) * scale)
             else:
                 if elem_id == self.highlighted_elem:
-                    pen = QPen(QColor(79, 195, 247), 2, Qt.PenStyle.DashLine)
+                    pen = QPen(QColor(79, 195, 247, 150), 2.5, Qt.PenStyle.SolidLine)
                     painter.setPen(pen)
-                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.setBrush(QColor(79, 195, 247, 20))
                     painter.drawRoundedRect(rect, 4, 4)
-                    # Draw resize handles
                     handles = self._get_handle_positions(rect)
-                    handle_size = 6
-                    handle_color = QColor(79, 195, 247)
+                    handle_size = 5
+                    handle_color = QColor(79, 195, 247, 200)
                     painter.setBrush(handle_color)
-                    painter.setPen(QPen(QColor(255, 255, 255), 1))
+                    painter.setPen(QPen(QColor(255, 255, 255, 180), 1))
                     for hpos in handles.values():
-                        painter.drawRect(hpos.x() - handle_size//2, hpos.y() - handle_size//2, handle_size, handle_size)
+                        painter.drawEllipse(hpos, handle_size//2, handle_size//2)
 
             if config.get("type") == "custom_image":
                 painter.setPen(color)
@@ -3540,7 +3838,6 @@ class PreviewCanvas(QWidget):
         pos = event.pos()
         layout = self.project.custom_layout or {}
 
-        # Check resize handles first
         handle = self._hit_test_handle(pos, self.highlighted_elem)
         if handle:
             config = self.project.custom_layout.get(self.highlighted_elem, {})
@@ -3599,8 +3896,24 @@ class PreviewCanvas(QWidget):
             if "t" in handle:
                 new_h = max(20, start_h - dy_logic)
 
+            if start_w > 0 and start_h > 0:
+                w_ratio = new_w / start_w
+                h_ratio = new_h / start_h
+                raw_scale = max(w_ratio, h_ratio)
+                if raw_scale > 1.0:
+                    scale_factor = 1.0 + (raw_scale - 1.0) * 0.25
+                else:
+                    scale_factor = max(0.5, 1.0 - (1.0 - raw_scale) * 0.5)
+                old_font_size = config.get("font_size", 14)
+                new_font_size = max(6, min(72, int(old_font_size * scale_factor)))
+                config["font_size"] = new_font_size
+
             config["custom_width"] = new_w
             config["custom_height"] = new_h
+
+            if hasattr(self.editor, 'current_elem') and self.editor.current_elem == self._resizing_elem:
+                self.editor._update_ui_from_config()
+
             self.update()
             return
 
@@ -3619,7 +3932,6 @@ class PreviewCanvas(QWidget):
             if self._resizing_elem:
                 self._resizing_elem = None
                 self._resize_handle = None
-                # Refresh the real window
                 if self.editor.window:
                     self.editor.window.apply_custom_layout()
             self.dragging_elem = None
@@ -3654,10 +3966,8 @@ class PluginIntroductionDialog(QDialog):
         title.setStyleSheet(f"font-size: 18pt; font-weight: bold; color: {get_theme_colors(theme)['accent']};")
         layout.addWidget(title)
 
-        # 使用 QTabWidget 分类
         tabs = QTabWidget()
 
-        # Tab1: 快速入门
         tab_intro = QWidget()
         intro_layout = QVBoxLayout(tab_intro)
         intro_text = QTextEdit()
@@ -3686,7 +3996,6 @@ class PluginIntroductionDialog(QDialog):
         intro_layout.addWidget(intro_text)
         tabs.addTab(tab_intro, "📖 入门")
 
-        # Tab2: 开发指南
         tab_dev = QWidget()
         dev_layout = QVBoxLayout(tab_dev)
         dev_text = QTextEdit()
@@ -3860,9 +4169,12 @@ class AppearanceEditor(QDialog):
         left_layout.addWidget(self.element_list)
 
         btn_layout = QHBoxLayout()
+        btn_layout.setContentsMargins(0, 0, 0, 8)
         self.btn_add = QPushButton("➕ 添加")
+        self.btn_add.setProperty("primary", True)
         self.btn_add.clicked.connect(self.add_element)
         self.btn_remove = QPushButton("➖ 删除")
+        self.btn_remove.setProperty("danger", True)
         self.btn_remove.clicked.connect(self.remove_element)
         self.btn_remove.setEnabled(False)
         btn_layout.addWidget(self.btn_add)
@@ -3870,9 +4182,12 @@ class AppearanceEditor(QDialog):
         left_layout.addLayout(btn_layout)
 
         order_layout = QHBoxLayout()
+        order_layout.setContentsMargins(0, 0, 0, 16)
         self.btn_up = QPushButton("⬆ 上移")
+        self.btn_up.setProperty("secondary", True)
         self.btn_up.clicked.connect(self.move_element_up)
         self.btn_down = QPushButton("⬇ 下移")
+        self.btn_down.setProperty("secondary", True)
         self.btn_down.clicked.connect(self.move_element_down)
         order_layout.addWidget(self.btn_up)
         order_layout.addWidget(self.btn_down)
@@ -3881,8 +4196,7 @@ class AppearanceEditor(QDialog):
         btn_plugin_help = QPushButton("🔌 如何添加更多元素？")
         btn_plugin_help.setStyleSheet(f"background-color: {get_theme_colors(self.current_theme)['secondary_text']}; color: white; border-radius: 4px; padding: 6px;")
         btn_plugin_help.clicked.connect(self.go_to_plugin_help)
-
-        main_layout.addWidget(left_panel)
+        left_layout.addWidget(btn_plugin_help)
 
         center_panel = QWidget()
         center_layout = QVBoxLayout(center_panel)
@@ -3913,10 +4227,7 @@ class AppearanceEditor(QDialog):
         self.cb_snap.toggled.connect(lambda v: setattr(self.preview_canvas, 'snap_enabled', v))
         self.cb_guides.toggled.connect(self.preview_canvas.update)
 
-        main_layout.addWidget(center_panel, 1)
-
         right_panel = QWidget()
-        right_panel.setFixedWidth(280)
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(10, 10, 10, 10)
         right_layout.setSpacing(8)
@@ -3945,7 +4256,10 @@ class AppearanceEditor(QDialog):
         self.general_section.addWidget(self.cb_visible)
 
         size_layout = QHBoxLayout()
-        size_layout.addWidget(QLabel("字体大小"))
+        lbl_font_size = QLabel("字体大小")
+        lbl_font_size.setFixedWidth(80)
+        lbl_font_size.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        size_layout.addWidget(lbl_font_size)
         self.spin_font_size = QSpinBox()
         self.spin_font_size.setRange(6, 72)
         self.spin_font_size.valueChanged.connect(self._on_property_changed)
@@ -3953,7 +4267,10 @@ class AppearanceEditor(QDialog):
         self.general_section.addLayout(size_layout)
 
         font_family_layout = QHBoxLayout()
-        font_family_layout.addWidget(QLabel("字体"))
+        lbl_font_family = QLabel("字体")
+        lbl_font_family.setFixedWidth(80)
+        lbl_font_family.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        font_family_layout.addWidget(lbl_font_family)
         self.combo_font_family = QComboBox()
         self.combo_font_family.addItems(QFontDatabase.families())
         self.combo_font_family.setEditable(True)
@@ -3967,13 +4284,19 @@ class AppearanceEditor(QDialog):
         self.btn_color.clicked.connect(self._pick_color)
         self.btn_color.setStyleSheet(f"QPushButton {{ border-radius: 6px; border: 1px solid {get_theme_colors(self.current_theme)['border_color']}; }}")
         color_layout = QHBoxLayout()
-        color_layout.addWidget(QLabel("文字颜色"))
+        lbl_color = QLabel("文字颜色")
+        lbl_color.setFixedWidth(80)
+        lbl_color.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        color_layout.addWidget(lbl_color)
         color_layout.addStretch()
         color_layout.addWidget(self.btn_color)
         self.general_section.addLayout(color_layout)
 
         opacity_layout = QHBoxLayout()
-        opacity_layout.addWidget(QLabel("透明度"))
+        lbl_opacity = QLabel("透明度")
+        lbl_opacity.setFixedWidth(80)
+        lbl_opacity.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        opacity_layout.addWidget(lbl_opacity)
         self.slider_opacity = QSlider(Qt.Orientation.Horizontal)
         self.slider_opacity.setRange(0, 100)
         self.slider_opacity.setValue(100)
@@ -3985,6 +4308,7 @@ class AppearanceEditor(QDialog):
         self.general_section.addLayout(opacity_layout)
 
         self.prop_layout.addWidget(self.general_section)
+        self.prop_layout.addSpacing(12)
 
         self.stroke_section = CollapsibleSection("🖍️ 字体描边", initially_expanded=False)
         self.cb_stroke_enable = QCheckBox("启用描边")
@@ -3992,7 +4316,10 @@ class AppearanceEditor(QDialog):
         self.stroke_section.addWidget(self.cb_stroke_enable)
 
         stroke_color_layout = QHBoxLayout()
-        stroke_color_layout.addWidget(QLabel("描边颜色"))
+        lbl_stroke_color = QLabel("描边颜色")
+        lbl_stroke_color.setFixedWidth(80)
+        lbl_stroke_color.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        stroke_color_layout.addWidget(lbl_stroke_color)
         self.btn_stroke_color = QPushButton("")
         self.btn_stroke_color.setFixedSize(40, 22)
         self.btn_stroke_color.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -4003,7 +4330,10 @@ class AppearanceEditor(QDialog):
         self.stroke_section.addLayout(stroke_color_layout)
 
         width_layout = QHBoxLayout()
-        width_layout.addWidget(QLabel("宽度"))
+        lbl_stroke_width = QLabel("宽度")
+        lbl_stroke_width.setFixedWidth(80)
+        lbl_stroke_width.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        width_layout.addWidget(lbl_stroke_width)
         self.spin_stroke_width = QDoubleSpinBox()
         self.spin_stroke_width.setRange(0, 10)
         self.spin_stroke_width.setSingleStep(0.5)
@@ -4012,10 +4342,14 @@ class AppearanceEditor(QDialog):
         self.stroke_section.addLayout(width_layout)
 
         self.prop_layout.addWidget(self.stroke_section)
+        self.prop_layout.addSpacing(12)
 
         self.shadow_section = CollapsibleSection("🌑 文字阴影", initially_expanded=False)
         shadow_color_layout = QHBoxLayout()
-        shadow_color_layout.addWidget(QLabel("阴影颜色"))
+        lbl_shadow_color = QLabel("阴影颜色")
+        lbl_shadow_color.setFixedWidth(80)
+        lbl_shadow_color.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        shadow_color_layout.addWidget(lbl_shadow_color)
         self.btn_shadow_color = QPushButton("")
         self.btn_shadow_color.setFixedSize(40, 22)
         self.btn_shadow_color.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -4026,7 +4360,10 @@ class AppearanceEditor(QDialog):
         self.shadow_section.addLayout(shadow_color_layout)
 
         offx_layout = QHBoxLayout()
-        offx_layout.addWidget(QLabel("水平偏移"))
+        lbl_offx = QLabel("水平偏移")
+        lbl_offx.setFixedWidth(80)
+        lbl_offx.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        offx_layout.addWidget(lbl_offx)
         self.spin_shadow_offx = QSpinBox()
         self.spin_shadow_offx.setRange(-20, 20)
         self.spin_shadow_offx.valueChanged.connect(self._on_property_changed)
@@ -4034,7 +4371,10 @@ class AppearanceEditor(QDialog):
         self.shadow_section.addLayout(offx_layout)
 
         offy_layout = QHBoxLayout()
-        offy_layout.addWidget(QLabel("垂直偏移"))
+        lbl_offy = QLabel("垂直偏移")
+        lbl_offy.setFixedWidth(80)
+        lbl_offy.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        offy_layout.addWidget(lbl_offy)
         self.spin_shadow_offy = QSpinBox()
         self.spin_shadow_offy.setRange(-20, 20)
         self.spin_shadow_offy.valueChanged.connect(self._on_property_changed)
@@ -4042,7 +4382,10 @@ class AppearanceEditor(QDialog):
         self.shadow_section.addLayout(offy_layout)
 
         blur_layout = QHBoxLayout()
-        blur_layout.addWidget(QLabel("模糊半径"))
+        lbl_blur = QLabel("模糊半径")
+        lbl_blur.setFixedWidth(80)
+        lbl_blur.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        blur_layout.addWidget(lbl_blur)
         self.spin_shadow_blur = QDoubleSpinBox()
         self.spin_shadow_blur.setRange(0, 30)
         self.spin_shadow_blur.setSingleStep(0.5)
@@ -4051,10 +4394,14 @@ class AppearanceEditor(QDialog):
         self.shadow_section.addLayout(blur_layout)
 
         self.prop_layout.addWidget(self.shadow_section)
+        self.prop_layout.addSpacing(12)
 
         self.bg_section = CollapsibleSection("📦 元素背景", initially_expanded=True)
         bg_color_layout = QHBoxLayout()
-        bg_color_layout.addWidget(QLabel("背景颜色"))
+        lbl_bg_color = QLabel("背景颜色")
+        lbl_bg_color.setFixedWidth(80)
+        lbl_bg_color.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        bg_color_layout.addWidget(lbl_bg_color)
         self.btn_bg_color = QPushButton("")
         self.btn_bg_color.setFixedSize(40, 22)
         self.btn_bg_color.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -4065,7 +4412,10 @@ class AppearanceEditor(QDialog):
         self.bg_section.addLayout(bg_color_layout)
 
         radius_layout = QHBoxLayout()
-        radius_layout.addWidget(QLabel("圆角"))
+        lbl_radius = QLabel("圆角")
+        lbl_radius.setFixedWidth(80)
+        lbl_radius.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        radius_layout.addWidget(lbl_radius)
         self.spin_bg_radius = QDoubleSpinBox()
         self.spin_bg_radius.setRange(0, 30)
         self.spin_bg_radius.valueChanged.connect(self._on_property_changed)
@@ -4073,10 +4423,14 @@ class AppearanceEditor(QDialog):
         self.bg_section.addLayout(radius_layout)
 
         self.prop_layout.addWidget(self.bg_section)
+        self.prop_layout.addSpacing(12)
 
         self.align_section = CollapsibleSection("↔️ 对齐方式", initially_expanded=False)
         h_layout = QHBoxLayout()
-        h_layout.addWidget(QLabel("水平"))
+        lbl_align_h = QLabel("水平")
+        lbl_align_h.setFixedWidth(80)
+        lbl_align_h.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        h_layout.addWidget(lbl_align_h)
         self.combo_align_h = QComboBox()
         self.combo_align_h.addItems(["左", "中", "右"])
         self.combo_align_h.currentIndexChanged.connect(self._on_property_changed)
@@ -4084,7 +4438,10 @@ class AppearanceEditor(QDialog):
         self.align_section.addLayout(h_layout)
 
         v_layout = QHBoxLayout()
-        v_layout.addWidget(QLabel("垂直"))
+        lbl_align_v = QLabel("垂直")
+        lbl_align_v.setFixedWidth(80)
+        lbl_align_v.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        v_layout.addWidget(lbl_align_v)
         self.combo_align_v = QComboBox()
         self.combo_align_v.addItems(["上", "中", "下"])
         self.combo_align_v.currentIndexChanged.connect(self._on_property_changed)
@@ -4092,6 +4449,7 @@ class AppearanceEditor(QDialog):
         self.align_section.addLayout(v_layout)
 
         self.prop_layout.addWidget(self.align_section)
+        self.prop_layout.addSpacing(12)
 
         self.static_text_section = CollapsibleSection("📝 文本内容")
         self.edit_static_text = QLineEdit()
@@ -4100,6 +4458,47 @@ class AppearanceEditor(QDialog):
         self.static_text_section.addWidget(self.edit_static_text)
         self.static_text_section.setVisible(False)
         self.prop_layout.addWidget(self.static_text_section)
+
+        self.countdown_section = CollapsibleSection("⏳ 倒计时设置")
+        cd_layout = QHBoxLayout()
+        lbl_expired = QLabel("到期显示文字")
+        lbl_expired.setFixedWidth(80)
+        lbl_expired.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        cd_layout.addWidget(lbl_expired)
+        self.edit_expired_text = QLineEdit()
+        self.edit_expired_text.setPlaceholderText("留空则显示 0.000 天")
+        self.edit_expired_text.textChanged.connect(self._on_property_changed)
+        cd_layout.addWidget(self.edit_expired_text)
+        self.countdown_section.addLayout(cd_layout)
+
+        cd_fmt_layout = QHBoxLayout()
+        lbl_format = QLabel("显示格式")
+        lbl_format.setFixedWidth(80)
+        lbl_format.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        cd_fmt_layout.addWidget(lbl_format)
+        self.combo_display_format = QComboBox()
+        self.combo_display_format.addItems(["小数 (天)", "整数 (天)", "时分秒", "自定义模板"])
+        self.combo_display_format.currentIndexChanged.connect(self._on_display_format_changed)
+        cd_fmt_layout.addWidget(self.combo_display_format)
+        self.countdown_section.addLayout(cd_fmt_layout)
+
+        self.custom_template_row = QWidget()
+        ct_layout = QHBoxLayout(self.custom_template_row)
+        ct_layout.setContentsMargins(0, 0, 0, 0)
+        lbl_template = QLabel("模板")
+        lbl_template.setFixedWidth(80)
+        lbl_template.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        ct_layout.addWidget(lbl_template)
+        self.edit_format_template = QLineEdit()
+        self.edit_format_template.setPlaceholderText("{days}天 {hours}时 {minutes}分 {seconds}秒")
+        self.edit_format_template.textChanged.connect(self._on_property_changed)
+        ct_layout.addWidget(self.edit_format_template)
+        self.countdown_section.addWidget(self.custom_template_row)
+        self.custom_template_row.setVisible(False)
+
+        self.countdown_section.setVisible(False)
+        self.prop_layout.addWidget(self.countdown_section)
+        self.prop_layout.addSpacing(12)
 
         self.weather_section = CollapsibleSection("🌤️ 天气设置")
         self.combo_weather_province = QComboBox()
@@ -4114,6 +4513,7 @@ class AppearanceEditor(QDialog):
         self._update_weather_cities(self.combo_weather_province.currentText())
         self.weather_section.setVisible(False)
         self.prop_layout.addWidget(self.weather_section)
+        self.prop_layout.addSpacing(12)
 
         self.pomo_section = CollapsibleSection("🍅 番茄钟设置")
         pomo_layout = QFormLayout()
@@ -4130,6 +4530,7 @@ class AppearanceEditor(QDialog):
         self.pomo_section.addLayout(pomo_layout)
         self.pomo_section.setVisible(False)
         self.prop_layout.addWidget(self.pomo_section)
+        self.prop_layout.addSpacing(12)
 
         self.poem_section = CollapsibleSection("📜 诗语轻扬设置")
         self.spin_typewriter = QSpinBox()
@@ -4141,6 +4542,7 @@ class AppearanceEditor(QDialog):
         self.poem_section.addWidget(self.spin_typewriter)
         self.poem_section.setVisible(False)
         self.prop_layout.addWidget(self.poem_section)
+        self.prop_layout.addSpacing(12)
 
         self.tip_section = CollapsibleSection("💡 小提示设置")
         tip_layout = QFormLayout()
@@ -4158,8 +4560,139 @@ class AppearanceEditor(QDialog):
         self.prop_scroll.setWidget(prop_widget)
         right_layout.addWidget(self.prop_scroll)
 
+        tc2 = get_theme_colors(self.current_theme)
+        self.win_settings_box = QGroupBox("🪟 窗口设置")
+        self.win_settings_box.setStyleSheet(f"""
+            QGroupBox {{
+                color: {tc2['text_color']};
+                font-weight: bold; font-size: 12px;
+                border: 1px solid {tc2['border_color']};
+                border-radius: 7px; margin-top: 10px; padding: 12px 6px 6px 6px;
+            }}
+            QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 5px; }}
+            QLabel {{ color: {tc2['text_color']}; font-size: 11px; }}
+            QComboBox {{ font-size: 11px; padding: 2px 4px; }}
+            QPushButton {{ font-size: 11px; }}
+        """)
+        win_lay = QVBoxLayout(self.win_settings_box)
+        win_lay.setSpacing(6)
+        win_lay.setContentsMargins(6, 4, 6, 6)
+
+        row_a = QHBoxLayout()
+        row_a.addWidget(QLabel("窗口透明度"))
+        self.win_alpha_slider = QSlider(Qt.Orientation.Horizontal)
+        self.win_alpha_slider.setRange(10, 100)
+        self.win_alpha_slider.setValue(int(self.project.window_alpha * 100))
+        self.win_alpha_label = QLabel(f"{int(self.project.window_alpha * 100)}%")
+        self.win_alpha_label.setFixedWidth(32)
+        self.win_alpha_slider.valueChanged.connect(
+            lambda v: self.win_alpha_label.setText(f"{v}%"))
+        row_a.addWidget(self.win_alpha_slider)
+        row_a.addWidget(self.win_alpha_label)
+        win_lay.addLayout(row_a)
+
+        row_b = QHBoxLayout()
+        row_b.addWidget(QLabel("背景类型"))
+        self.win_combo_bg = QComboBox()
+        self.win_combo_bg.addItems(["🎨 纯色", "🖼️ 图片", "🌈 渐变", "🌌 动态"])
+        bg_map = {"color": "🎨 纯色", "image": "🖼️ 图片", "gradient": "🌈 渐变", "dynamic": "🌌 动态"}
+        self.win_combo_bg.setCurrentText(bg_map.get(self.project.background_type, "🎨 纯色"))
+        self.win_combo_bg.currentTextChanged.connect(self._on_win_bg_type_changed)
+        row_b.addWidget(self.win_combo_bg)
+        win_lay.addLayout(row_b)
+
+        self.win_color_row = QWidget()
+        row_c = QHBoxLayout(self.win_color_row)
+        row_c.setContentsMargins(0, 0, 0, 0)
+        row_c.addWidget(QLabel("背景色"))
+        self.win_bg_color_btn = QPushButton()
+        self.win_bg_color_btn.setFixedSize(38, 24)
+        self.win_bg_color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.win_bg_color_btn.setStyleSheet(
+            f"background-color: {self.project.bg_color}; border-radius: 4px; border: 1px solid {tc2['border_color']};")
+        self.win_bg_color_btn.clicked.connect(self._pick_win_bg_color)
+        row_c.addStretch()
+        row_c.addWidget(self.win_bg_color_btn)
+        win_lay.addWidget(self.win_color_row)
+
+        self.win_grad_row = QWidget()
+        row_g = QHBoxLayout(self.win_grad_row)
+        row_g.setContentsMargins(0, 0, 0, 0)
+        row_g.setSpacing(4)
+        self.win_grad_start_btn = QPushButton("起点")
+        self.win_grad_start_btn.setFixedSize(54, 24)
+        self.win_grad_start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.win_grad_start_btn.setStyleSheet(
+            f"background-color: {self.project.gradient_start}; color: black; font-size: 10px; border-radius: 4px; border: 1px solid {tc2['border_color']};")
+        self.win_grad_start_btn.clicked.connect(lambda: self._pick_win_color_attr(self.win_grad_start_btn, "grad_start"))
+        self.win_grad_end_btn = QPushButton("终点")
+        self.win_grad_end_btn.setFixedSize(54, 24)
+        self.win_grad_end_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.win_grad_end_btn.setStyleSheet(
+            f"background-color: {self.project.gradient_end}; color: black; font-size: 10px; border-radius: 4px; border: 1px solid {tc2['border_color']};")
+        self.win_grad_end_btn.clicked.connect(lambda: self._pick_win_color_attr(self.win_grad_end_btn, "grad_end"))
+        row_g.addWidget(self.win_grad_start_btn)
+        row_g.addWidget(self.win_grad_end_btn)
+        win_lay.addWidget(self.win_grad_row)
+
+        self.win_img_row = QWidget()
+        img_r = QHBoxLayout(self.win_img_row)
+        img_r.setContentsMargins(0, 0, 0, 0)
+        img_r.setSpacing(4)
+        self.win_combo_image = QComboBox()
+        self.win_combo_image.setMinimumHeight(24)
+        self._refresh_win_image_list()
+        self.win_combo_image.setCurrentText(self.project.background_image)
+        self.win_btn_upload_img = QPushButton("📁")
+        self.win_btn_upload_img.setFixedSize(34, 24)
+        self.win_btn_upload_img.setToolTip("上传图片")
+        self.win_btn_upload_img.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.win_btn_upload_img.clicked.connect(self._upload_win_bg_image)
+        img_r.addWidget(self.win_combo_image)
+        img_r.addWidget(self.win_btn_upload_img)
+        win_lay.addWidget(self.win_img_row)
+
+        self.win_dyn_row = QWidget()
+        dyn_r = QHBoxLayout(self.win_dyn_row)
+        dyn_r.setContentsMargins(0, 0, 0, 0)
+        dyn_r.setSpacing(4)
+        self.win_combo_dyn = QComboBox()
+        self.win_combo_dyn.setMinimumHeight(24)
+        if self.window and hasattr(self.window, 'master'):
+            for key, name in self.window.master.dynamic_bg_registry.items():
+                self.win_combo_dyn.addItem(name, key)
+        idx = self.win_combo_dyn.findData(self.project.dynamic_bg_type)
+        if idx >= 0: self.win_combo_dyn.setCurrentIndex(idx)
+        self.win_combo_dyn_quality = QComboBox()
+        self.win_combo_dyn_quality.setMinimumHeight(24)
+        self.win_combo_dyn_quality.addItems(["⚡高", "🌓中", "🐢低"])
+        self.win_combo_dyn_quality.setCurrentIndex(
+            0 if self.project.dynamic_quality == "high" else
+            (1 if self.project.dynamic_quality == "medium" else 2))
+        dyn_r.addWidget(self.win_combo_dyn)
+        dyn_r.addWidget(self.win_combo_dyn_quality)
+        win_lay.addWidget(self.win_dyn_row)
+
+        row_f = QHBoxLayout()
+        row_f.addWidget(QLabel("字体颜色"))
+        self.win_font_color_btn = QPushButton()
+        self.win_font_color_btn.setFixedSize(38, 24)
+        self.win_font_color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.win_font_color_btn.setStyleSheet(
+            f"background-color: {self.project.font_color}; border-radius: 4px; border: 1px solid {tc2['border_color']};")
+        self.win_font_color_btn.clicked.connect(self._pick_win_font_color)
+        row_f.addStretch()
+        row_f.addWidget(self.win_font_color_btn)
+        win_lay.addLayout(row_f)
+
+        right_layout.addWidget(self.win_settings_box)
+
+        self._on_win_bg_type_changed(self.win_combo_bg.currentText())
+
         bottom_layout = QHBoxLayout()
+        bottom_layout.setContentsMargins(0, 8, 0, 16)
         self.btn_apply = QPushButton("✅ 应用并关闭")
+        self.btn_apply.setProperty("primary", True)
         self.btn_apply.clicked.connect(self.apply_and_close)
         self.btn_cancel = QPushButton("❌ 取消")
         self.btn_cancel.setProperty("secondary", True)
@@ -4169,9 +4702,19 @@ class AppearanceEditor(QDialog):
         bottom_layout.addWidget(self.btn_cancel)
         right_layout.addLayout(bottom_layout)
 
-        main_layout.addWidget(right_panel)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(center_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+
+        main_layout.addWidget(left_panel)
+        main_layout.addWidget(splitter, 1)
 
         self._populate_element_list()
+        self.element_list.setCurrentRow(-1)
+        self.no_selection_label.setVisible(True)
+        self.prop_scroll.setVisible(False)
 
     def _update_weather_cities(self, province):
         self.combo_weather_city.blockSignals(True)
@@ -4185,8 +4728,32 @@ class AppearanceEditor(QDialog):
         dlg.exec()
 
     def apply_and_close(self):
+        self.project.window_alpha = self.win_alpha_slider.value() / 100.0
+
+        bg_text = self.win_combo_bg.currentText()
+        if "图片" in bg_text:
+            self.project.background_type = "image"
+        elif "渐变" in bg_text:
+            self.project.background_type = "gradient"
+        elif "动态" in bg_text:
+            self.project.background_type = "dynamic"
+        else:
+            self.project.background_type = "color"
+
+        self.project.bg_color = self.win_bg_color_btn.property("win_bg") or self.project.bg_color
+        self.project.gradient_start = self.win_grad_start_btn.property("win_grad_start") or self.project.gradient_start
+        self.project.gradient_end = self.win_grad_end_btn.property("win_grad_end") or self.project.gradient_end
+        self.project.background_image = self.win_combo_image.currentText() if self.project.background_type == "image" else ""
+        self.project.font_color = self.win_font_color_btn.property("win_font") or self.project.font_color
+
+        self.project.dynamic_bg_type = self.win_combo_dyn.currentData()
+        qmap = {0: "high", 1: "medium", 2: "low"}
+        self.project.dynamic_quality = qmap.get(self.win_combo_dyn_quality.currentIndex(), "high")
+
         if self.window:
             self.window.apply_custom_layout()
+            self.window.setup_dynamic_bg()
+            self.window.update()
         self.accept()
 
     def cancel_and_close(self):
@@ -4233,8 +4800,13 @@ class AppearanceEditor(QDialog):
         self.poem_section.setVisible(elem_id == "poem")
         self.tip_section.setVisible(elem_id == "tip")
         self.static_text_section.setVisible(elem_id == "static_text")
+        self.countdown_section.setVisible(elem_id == "countdown")
         self.preview_canvas.set_highlighted_element(elem_id)
 
+    def _update_ui_from_config(self):
+        if not self.current_elem:
+            return
+        self._load_element_properties(self.current_elem)
 
     def go_to_plugin_help(self):
         if self.window and self.window.master:
@@ -4307,6 +4879,15 @@ class AppearanceEditor(QDialog):
             self.spin_tip_interval.setValue(tip_interval)
         if elem_id == "static_text":
             self.edit_static_text.setText(elem.get("text", ""))
+        if elem_id == "countdown":
+            self.edit_expired_text.setText(self.project.expired_text)
+            fmt_map = {"decimal": 0, "integer": 1, "hms": 2, "custom": 3}
+            fmt_idx = fmt_map.get(getattr(self.project, 'display_format', 'decimal'), 0)
+            self.combo_display_format.blockSignals(True)
+            self.combo_display_format.setCurrentIndex(fmt_idx)
+            self.combo_display_format.blockSignals(False)
+            self.edit_format_template.setText(getattr(self.project, 'display_format_template', '{days}天 {hours}时 {minutes}分'))
+            self.custom_template_row.setVisible(fmt_idx == 3)
 
         self._updating_ui = False
 
@@ -4357,6 +4938,15 @@ class AppearanceEditor(QDialog):
             elem["interval"] = self.project.tip_interval
         if self.current_elem == "static_text":
             elem["text"] = self.edit_static_text.text()
+        if self.current_elem == "countdown":
+            self.project.expired_text = self.edit_expired_text.text()
+            fmt_map = {0: "decimal", 1: "integer", 2: "hms", 3: "custom"}
+            self.project.display_format = fmt_map.get(self.combo_display_format.currentIndex(), "decimal")
+            self.project.display_format_template = self.edit_format_template.text()
+            if self.window and hasattr(self.window, 'countdown_label'):
+                self.window.countdown_label.set_display_format(
+                    self.project.display_format, self.project.display_format_template)
+                self.window.update_ticking_countdown()
 
         self.preview_canvas.refresh_layout()
         self._update_list_item_text()
@@ -4399,6 +4989,10 @@ class AppearanceEditor(QDialog):
 
     def _on_slider_changed(self, val):
         self.label_opacity.setText(f"{val}%")
+        self._on_property_changed()
+
+    def _on_display_format_changed(self, index):
+        self.custom_template_row.setVisible(index == 3)
         self._on_property_changed()
 
     def add_element(self):
@@ -4501,6 +5095,63 @@ class AppearanceEditor(QDialog):
         self._populate_element_list()
         self.element_list.setCurrentRow(row + 1)
 
+    # ---------- 窗口级外观设置方法 ----------
+    def _on_win_bg_type_changed(self, text):
+        is_color = "纯色" in text
+        is_image = "图片" in text
+        is_grad = "渐变" in text
+        is_dyn = "动态" in text
+        self.win_color_row.setVisible(is_color)
+        self.win_grad_row.setVisible(is_grad)
+        self.win_img_row.setVisible(is_image)
+        self.win_dyn_row.setVisible(is_dyn)
+
+    def _pick_win_bg_color(self):
+        color = QColorDialog.getColor(QColor(self.project.bg_color), self, "选择窗口背景色")
+        if color.isValid():
+            self.win_bg_color_btn.setProperty("win_bg", color.name())
+            self.win_bg_color_btn.setStyleSheet(
+                f"background-color: {color.name()}; border-radius: 4px; border: 1px solid {get_theme_colors(self.current_theme)['border_color']};")
+
+    def _pick_win_color_attr(self, btn, attr_name):
+        cur = btn.property(f"win_{attr_name}") or (
+            self.project.gradient_start if attr_name == "grad_start" else self.project.gradient_end)
+        color = QColorDialog.getColor(QColor(cur), self, "选择颜色")
+        if color.isValid():
+            btn.setProperty(f"win_{attr_name}", color.name())
+            btn.setStyleSheet(
+                f"background-color: {color.name()}; color: black; font-size: 10px; border-radius: 4px; "
+                f"border: 1px solid {get_theme_colors(self.current_theme)['border_color']};")
+
+    def _pick_win_font_color(self):
+        color = QColorDialog.getColor(QColor(self.project.font_color), self, "选择窗口字体颜色")
+        if color.isValid():
+            self.win_font_color_btn.setProperty("win_font", color.name())
+            self.win_font_color_btn.setStyleSheet(
+                f"background-color: {color.name()}; border-radius: 4px; border: 1px solid {get_theme_colors(self.current_theme)['border_color']};")
+
+    def _refresh_win_image_list(self):
+        self.win_combo_image.clear()
+        if not hasattr(self, 'window') or not self.window:
+            return
+        user_dir = getattr(self.window.master, 'user_dir', '') if hasattr(self.window, 'master') else ''
+        if user_dir and os.path.exists(user_dir):
+            images = [f for f in os.listdir(user_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif'))]
+            self.win_combo_image.addItems(images)
+
+    def _upload_win_bg_image(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "上传背景图片", "", "Images (*.png *.jpg *.jpeg *.bmp *.gif)")
+        if file_path:
+            import shutil
+            filename = os.path.basename(file_path)
+            user_dir = getattr(self.window.master, 'user_dir', '') if hasattr(self.window, 'master') else ''
+            if user_dir:
+                dest_path = os.path.join(user_dir, filename)
+                if not os.path.exists(dest_path):
+                    shutil.copy(file_path, dest_path)
+                self._refresh_win_image_list()
+                self.win_combo_image.setCurrentText(filename)
+
 class ProjectEditorDialog(QDialog):
     def __init__(self, app, project, parent=None):
         super().__init__(parent)
@@ -4508,235 +5159,148 @@ class ProjectEditorDialog(QDialog):
         self.project = project
         self.setStyleSheet(get_theme_qss(self.app.theme))
         self.setWindowTitle(tr("edit_project") + f" - {project.name}")
-        self.resize(500, 700)
+        self.setMinimumSize(420, 280)
+        self.resize(460, 340)
 
         main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(14)
 
-        form_layout = QFormLayout()
-        form_layout.setSpacing(15)
+        tc = get_theme_colors(self.app.theme)
+
+        # ---- 项目信息 ----
+        grp = QGroupBox("📋 项目信息")
+        grp.setStyleSheet(f"""
+            QGroupBox {{
+                color: {tc['text_color']};
+                font-weight: bold; font-size: 13px;
+                border: 1px solid {tc['border_color']};
+                border-radius: 8px; margin-top: 10px; padding: 14px 10px 10px 10px;
+            }}
+            QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 6px; }}
+        """)
+        form = QFormLayout(grp)
+        form.setSpacing(10)
 
         self.edit_name = QLineEdit(self.project.name)
-        form_layout.addRow(tr("project_name") + ":", self.edit_name)
+        self.edit_name.setMinimumHeight(32)
+        self.edit_name.setStyleSheet(f"border-radius: 5px; padding: 4px 8px;")
+        form.addRow(tr("project_name") + ":", self.edit_name)
 
+        date_layout = QHBoxLayout()
+        date_layout.setSpacing(4)
         self.edit_date = QLineEdit(self.project.target_date)
         self.edit_date.setPlaceholderText("YYYY-MM-DD")
-        form_layout.addRow(tr("target_date") + ":", self.edit_date)
+        self.edit_date.setMinimumHeight(32)
+        self.edit_date.setStyleSheet(f"border-radius: 5px; padding: 4px 8px;")
+        date_layout.addWidget(self.edit_date)
+
+        btn_cal = QPushButton("📅")
+        btn_cal.setFixedWidth(36)
+        btn_cal.setMinimumHeight(32)
+        btn_cal.setToolTip("点击选择日期")
+        btn_cal.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_cal.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {tc['input_bg']};
+                border: 1px solid {tc['border_color']};
+                border-radius: 5px; font-size: 16px;
+            }}
+            QPushButton:hover {{ background-color: {tc['accent']}; }}
+        """)
+        btn_cal.clicked.connect(self._show_calendar)
+        date_layout.addWidget(btn_cal)
+        form.addRow(tr("target_date") + ":", date_layout)
 
         time_layout = QHBoxLayout()
+        time_layout.setSpacing(8)
         self.chk_exact_time = QCheckBox(tr("set_exact_time"))
         self.chk_exact_time.setChecked(self.project.target_time != "00:00")
         self.edit_time = QLineEdit(self.project.target_time if self.project.target_time != "00:00" else "08:00")
         self.edit_time.setEnabled(self.chk_exact_time.isChecked())
+        self.edit_time.setMinimumHeight(32)
+        self.edit_time.setPlaceholderText("HH:MM")
+        self.edit_time.setStyleSheet(f"border-radius: 5px; padding: 4px 8px;")
         self.chk_exact_time.toggled.connect(self.edit_time.setEnabled)
         time_layout.addWidget(self.chk_exact_time)
         time_layout.addWidget(self.edit_time)
-        form_layout.addRow(tr("target_time") + ":", time_layout)
+        form.addRow(tr("target_time") + ":", time_layout)
 
         self.chk_show_both = QCheckBox(tr("show_both"))
         self.chk_show_both.setChecked(self.project.show_both)
-        form_layout.addRow("", self.chk_show_both)
+        self.chk_show_both.setToolTip("同时显示已过天数和剩余天数")
+        form.addRow("", self.chk_show_both)
 
-        font_layout = QHBoxLayout()
-        self.spin_font = QSpinBox()
-        self.spin_font.setRange(8, 72)
-        self.spin_font.setValue(self.project.font_size)
-        self.chk_auto_font = QCheckBox(tr("auto_font"))
-        self.chk_auto_font.setChecked(self.project.auto_font)
-        self.chk_auto_font.toggled.connect(lambda checked: self.spin_font.setDisabled(checked))
-        self.spin_font.setDisabled(self.project.auto_font)
-        font_layout.addWidget(self.spin_font)
-        font_layout.addWidget(self.chk_auto_font)
-        form_layout.addRow(tr("font_size") + ":", font_layout)
+        main_layout.addWidget(grp)
 
-        self.spin_alpha = QDoubleSpinBox()
-        self.spin_alpha.setRange(0.1, 1.0)
-        self.spin_alpha.setSingleStep(0.05)
-        self.spin_alpha.setValue(self.project.window_alpha)
-        form_layout.addRow(tr("window_alpha") + ":", self.spin_alpha)
+        hint = QLabel("💡 字体、颜色、背景等外观设置请使用「自定义外观编辑器」")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {tc['secondary_text']}; font-size: 11px; padding: 2px 4px;")
+        main_layout.addWidget(hint)
 
-        self.spin_typewriter = QSpinBox()
-        self.spin_typewriter.setRange(1, 120)
-        self.spin_typewriter.setValue(self.project.typewriter_interval)
-        self.spin_typewriter.setSuffix(" 分钟")
-        form_layout.addRow(tr("typewriter_interval_label") + ":", self.spin_typewriter)
-
-        bg_layout = QHBoxLayout()
-        self.combo_bg_type = QComboBox()
-        self.combo_bg_type.addItems(["🎨 纯色", "🖼️ 图片", "🌈 渐变", "🌌 动态"])
-        bg_map = {"color": "🎨 纯色", "image": "🖼️ 图片", "gradient": "🌈 渐变", "dynamic": "🌌 动态"}
-        self.combo_bg_type.setCurrentText(bg_map.get(self.project.background_type, "🎨 纯色"))
-
-        self.btn_bg_color = QPushButton(tr("choose_bg_color"))
-        self.current_bg_color = self.project.bg_color
-        self.btn_bg_color.setStyleSheet(f"background-color: {self.current_bg_color}; color: white;")
-        self.btn_bg_color.clicked.connect(self.pick_bg_color)
-
-        self.btn_grad_start = QPushButton("起点色")
-        self.btn_grad_start.setStyleSheet(f"background-color: {self.project.gradient_start}; color: black;")
-        self.btn_grad_start.clicked.connect(lambda: self.pick_specific_color(self.btn_grad_start, "gradient_start"))
-
-        self.btn_grad_end = QPushButton("终点色")
-        self.btn_grad_end.setStyleSheet(f"background-color: {self.project.gradient_end}; color: black;")
-        self.btn_grad_end.clicked.connect(lambda: self.pick_specific_color(self.btn_grad_end, "gradient_end"))
-
-        self.combo_dynamic = QComboBox()
-        for key, name in self.app.dynamic_bg_registry.items():
-            self.combo_dynamic.addItem(name, key)
-        idx = self.combo_dynamic.findData(self.project.dynamic_bg_type)
-        if idx >= 0: self.combo_dynamic.setCurrentIndex(idx)
-
-        self.combo_dyn_quality = QComboBox()
-        self.combo_dyn_quality.addItems(["⚡ 高画质", "🌓 中画质", "🐢 低画质"])
-        self.combo_dyn_quality.setCurrentIndex(0 if self.project.dynamic_quality == "high" else (1 if self.project.dynamic_quality == "medium" else 2))
-
-        self.combo_dyn_fps = QComboBox()
-        self.combo_dyn_fps.addItems(["30 FPS", "60 FPS", "120 FPS"])
-        self.combo_dyn_fps.setCurrentText(f"{self.project.dynamic_fps} FPS")
-
-        bg_layout.addWidget(self.combo_bg_type)
-        bg_layout.addWidget(self.btn_bg_color)
-        bg_layout.addWidget(self.btn_grad_start)
-        bg_layout.addWidget(self.btn_grad_end)
-        bg_layout.addWidget(self.combo_dynamic)
-        bg_layout.addWidget(self.combo_dyn_quality)
-        bg_layout.addWidget(self.combo_dyn_fps)
-        form_layout.addRow(tr("background_type") + ":", bg_layout)
-
-        self.img_container = QWidget()
-        img_layout = QHBoxLayout(self.img_container)
-        img_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.combo_image = QComboBox()
-        self.refresh_image_list()
-        self.combo_image.setCurrentText(self.project.background_image)
-
-        btn_upload = QPushButton(tr("upload_image"))
-        btn_upload.clicked.connect(self.upload_image)
-
-        img_layout.addWidget(self.combo_image)
-        img_layout.addWidget(btn_upload)
-        form_layout.addRow(tr("select_image") + ":", self.img_container)
-
-        def on_bg_type_changed(text):
-            self.img_container.setVisible("图片" in text)
-            self.btn_bg_color.setVisible("纯色" in text)
-            self.btn_grad_start.setVisible("渐变" in text)
-            self.btn_grad_end.setVisible("渐变" in text)
-            self.combo_dynamic.setVisible("动态" in text)
-            self.combo_dyn_quality.setVisible("动态" in text)
-            self.combo_dyn_fps.setVisible("动态" in text)
-
-        self.combo_bg_type.currentTextChanged.connect(on_bg_type_changed)
-        on_bg_type_changed(self.combo_bg_type.currentText())
-
-        self.btn_font_color = QPushButton(tr("choose_font_color"))
-        self.current_font_color = self.project.font_color
-        self.btn_font_color.setStyleSheet(f"background-color: {self.current_font_color}; color: white;")
-        self.btn_font_color.clicked.connect(self.pick_font_color)
-        form_layout.addRow(tr("font_color") + ":", self.btn_font_color)
-
-        main_layout.addLayout(form_layout)
         main_layout.addStretch()
 
         btn_save = QPushButton(tr("save"))
-        btn_save.setStyleSheet("background-color: #2ecc71; color: #FFFFFF; padding: 10px; border-radius: 5px; font-weight: bold; font-size: 14px;")
+        btn_save.setMinimumHeight(40)
+        btn_save.setStyleSheet(
+            "background-color: #2ecc71; color: #FFFFFF; padding: 10px 18px; "
+            "border-radius: 8px; font-weight: bold; font-size: 14px;")
+        btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_save.clicked.connect(self.save_project)
         main_layout.addWidget(btn_save)
 
-        grip_layout = QHBoxLayout()
-        grip_layout.addStretch()
-        grip_layout.addWidget(QSizeGrip(self))
-        main_layout.addLayout(grip_layout)
-
-    def pick_bg_color(self):
-        color = QColorDialog.getColor()
-        if color.isValid():
-            self.current_bg_color = color.name()
-            self.btn_bg_color.setStyleSheet(f"background-color: {self.current_bg_color}; color: white;")
-
-    def pick_font_color(self):
-        color = QColorDialog.getColor()
-        if color.isValid():
-            self.current_font_color = color.name()
-            self.btn_font_color.setStyleSheet(f"background-color: {self.current_font_color}; color: white;")
-
-    def pick_specific_color(self, button, attr_name):
-        color = QColorDialog.getColor()
-        if color.isValid():
-            setattr(self, attr_name, color.name())
-            button.setStyleSheet(f"background-color: {color.name()};")
-
-    def refresh_image_list(self):
-        self.combo_image.clear()
-        if os.path.exists(self.app.user_dir):
-            images = [f for f in os.listdir(self.app.user_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif'))]
-            self.combo_image.addItems(images)
-
-    def upload_image(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, tr("upload_image"), "", "Images (*.png *.jpg *.jpeg *.bmp *.gif)")
-        if file_path:
-            import shutil
-            filename = os.path.basename(file_path)
-            dest_path = os.path.join(self.app.user_dir, filename)
-            if not os.path.exists(dest_path):
-                shutil.copy(file_path, dest_path)
-            self.refresh_image_list()
-            self.combo_image.setCurrentText(filename)
+    def _show_calendar(self):
+        cal_dlg = QDialog(self)
+        cal_dlg.setWindowTitle("选择日期")
+        cal_dlg.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        cal_dlg.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        cal_layout = QVBoxLayout(cal_dlg)
+        cal_layout.setContentsMargins(4, 4, 4, 4)
+        cal = QCalendarWidget()
+        cal.setGridVisible(True)
+        cal.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
+        cal.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+        cal.setStyleSheet("""
+            QCalendarWidget QToolButton { height: 28px; font-weight: bold; }
+            QCalendarWidget QMenu { width: 150px; }
+            QCalendarWidget QTableView { selection-background-color: #3498db; }
+        """)
+        try:
+            d = QDate.fromString(self.edit_date.text().strip(), "yyyy-MM-dd")
+            if d.isValid():
+                cal.setSelectedDate(d)
+        except:
+            pass
+        cal.clicked.connect(lambda qdate: (
+            self.edit_date.setText(qdate.toString("yyyy-MM-dd")),
+            cal_dlg.accept()
+        ))
+        cal_layout.addWidget(cal)
+        cal_dlg.resize(310, 260)
+        pos = self.edit_date.mapToGlobal(self.edit_date.rect().bottomLeft())
+        cal_dlg.move(pos + QPoint(0, 4))
+        cal_dlg.exec()
 
     def save_project(self):
-        date_str = self.edit_date.text()
+        date_str = self.edit_date.text().strip()
         if not validate_date(date_str):
             QMessageBox.critical(self, "错误", "日期格式无效！请使用 YYYY-MM-DD")
             return
-        time_str = self.edit_time.text() if self.chk_exact_time.isChecked() else "00:00"
+        time_str = self.edit_time.text().strip() if self.chk_exact_time.isChecked() else "00:00"
         if self.chk_exact_time.isChecked() and not validate_time(time_str):
             QMessageBox.critical(self, "错误", "时间格式无效！请使用 HH:MM")
             return
 
-        self.project.name = self.edit_name.text()
+        self.project.name = self.edit_name.text().strip()
         self.project.target_date = date_str
         self.project.target_time = time_str
         self.project.show_both = self.chk_show_both.isChecked()
-        self.project.font_size = self.spin_font.value()
-        self.project.auto_font = self.chk_auto_font.isChecked()
-        self.project.window_alpha = self.spin_alpha.value()
-        self.project.typewriter_interval = self.spin_typewriter.value()
-
-        bg_text = self.combo_bg_type.currentText()
-        if "图片" in bg_text:
-            self.project.background_type = "image"
-        elif "渐变" in bg_text:
-            self.project.background_type = "gradient"
-        elif "动态" in bg_text:
-            self.project.background_type = "dynamic"
-        else:
-            self.project.background_type = "color"
-
-        self.project.background_image = self.combo_image.currentText() if self.project.background_type == "image" else ""
-        self.project.bg_color = self.current_bg_color
-        self.project.font_color = self.current_font_color
-
-        self.project.dynamic_bg_type = self.combo_dynamic.currentData()
-        self.project.dynamic_quality = "high" if self.combo_dyn_quality.currentIndex() == 0 else ("medium" if self.combo_dyn_quality.currentIndex() == 1 else "low")
-        self.project.dynamic_fps = int(self.combo_dyn_fps.currentText().split()[0])
-
-        if hasattr(self, 'gradient_start'):
-            self.project.gradient_start = self.gradient_start
-        if hasattr(self, 'gradient_end'):
-            self.project.gradient_end = self.gradient_end
 
         self.app.save_config(force=True)
         for win in self.app.windows:
             if win.project == self.project:
                 win.refresh()
-                win.typewriter_timer.setInterval(self.project.typewriter_interval * 60000)
-                tip_interval = self.project.tip_interval if hasattr(self.project, 'tip_interval') else self.project.typewriter_interval
-                win.tip_timer.setInterval(tip_interval * 60000)
         self.accept()
-
-        for win in self.app.windows:
-          if win.project == self.project:
-             win.update_pomodoro_settings()
 
 
 class DebugConsole(QDialog):
@@ -4750,6 +5314,8 @@ class DebugConsole(QDialog):
         self.is_root = False
         self.root_eligible = self._check_root_eligible()
 
+        self.log_forward_enabled = False
+
         self.allowed_dirs = [
             os.path.abspath(self.app.data_dir),
             os.path.abspath(os.path.dirname(self.app.config_path)),
@@ -4762,6 +5328,7 @@ class DebugConsole(QDialog):
 
         self._setup_ui()
         self._register_commands()
+        self._update_log_callback()
         self._show_welcome()
 
         self.input_line.setFocus()
@@ -4814,11 +5381,73 @@ class DebugConsole(QDialog):
             QLineEdit:focus {{
                 border: 1px solid {c['input_focus_border']};
             }}
+            QCheckBox {{
+                color: {c['console_text']};
+                font-family: 'Microsoft YaHei', sans-serif;
+                font-size: 10pt;
+                spacing: 4px;
+            }}
+            QCheckBox::indicator {{
+                width: 14px;
+                height: 14px;
+                border: 1px solid {c['border_color']};
+                border-radius: 2px;
+                background: {c['input_bg']};
+            }}
+            QCheckBox::indicator:checked {{
+                background: {c['input_focus_border']};
+                border-color: {c['input_focus_border']};
+            }}
         """)
 
         layout = QVBoxLayout(self)
-        layout.setSpacing(6)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+        layout.setContentsMargins(8, 6, 8, 8)
+
+        toolbar_layout = QHBoxLayout()
+        toolbar_layout.setSpacing(8)
+
+        self.log_toggle = QCheckBox("📋 日志转发（开启后日志实时显示在控制台）")
+        self.log_toggle.setChecked(False)
+        self.log_toggle.stateChanged.connect(self._on_log_toggle_changed)
+        self.log_toggle.setToolTip("默认关闭：防止日志刷屏覆盖调试信息\n开启后所有 log_message 输出将实时显示在控制台中")
+        toolbar_layout.addWidget(self.log_toggle)
+
+        toolbar_layout.addStretch()
+
+        btn_clear = QPushButton("清屏")
+        btn_clear.setFixedSize(60, 24)
+        btn_clear.setStyleSheet(f"""
+            QPushButton {{
+                background: {c['input_bg']};
+                color: {c['console_text']};
+                border: 1px solid {c['border_color']};
+                border-radius: 3px;
+                font-size: 10pt;
+                padding: 2px 6px;
+            }}
+            QPushButton:hover {{ border-color: {c['input_focus_border']}; }}
+        """)
+        btn_clear.clicked.connect(lambda: self.output.clear())
+        toolbar_layout.addWidget(btn_clear)
+
+        btn_help = QPushButton("帮助")
+        btn_help.setFixedSize(60, 24)
+        btn_help.setStyleSheet(f"""
+            QPushButton {{
+                background: {c['input_bg']};
+                color: {c['console_text']};
+                border: 1px solid {c['border_color']};
+                border-radius: 3px;
+                font-size: 10pt;
+                padding: 2px 6px;
+            }}
+            QPushButton:hover {{ border-color: {c['input_focus_border']}; }}
+        """)
+        btn_help.clicked.connect(self.show_help)
+        toolbar_layout.addWidget(btn_help)
+
+        layout.addLayout(toolbar_layout)
 
         self.output = QTextEdit()
         self.output.setReadOnly(True)
@@ -4829,8 +5458,9 @@ class DebugConsole(QDialog):
         self.prompt_label = QLabel(">>> ")
         self.prompt_label.setStyleSheet(f"color: {get_theme_colors(get_system_theme())['input_focus_border']}; font-weight: bold;")
         self.input_line = QLineEdit()
-        self.input_line.setPlaceholderText("help?")
+        self.input_line.setPlaceholderText("输入 help 查看命令 | ↑↓ 历史 | Tab 补全")
         self.input_line.returnPressed.connect(self.execute_command)
+        self.input_line.installEventFilter(self)
         input_layout.addWidget(self.prompt_label)
         input_layout.addWidget(self.input_line)
         layout.addLayout(input_layout)
@@ -4870,6 +5500,80 @@ class DebugConsole(QDialog):
             """
         self.input_line.setStyleSheet(style)
 
+    # ---- 日志转发控制 ----
+
+    def _on_log_toggle_changed(self, state):
+        self.log_forward_enabled = (state == Qt.CheckState.Checked.value)
+        self._update_log_callback()
+        status = "已开启" if self.log_forward_enabled else "已关闭"
+        self.write_info(f"日志转发 {status}（{'实时显示' if self.log_forward_enabled else '仅写入文件'}）")
+
+    def _update_log_callback(self):
+        if self.log_forward_enabled:
+            set_console_log_callback(self._on_log_forward)
+        else:
+            set_console_log_callback(None)
+
+    def _on_log_forward(self, message, level, timestamp):
+        short_msg = message[:200] + ("..." if len(message) > 200 else "")
+        QTimer.singleShot(0, lambda: self._write_log_entry(short_msg, level, timestamp))
+
+    def _write_log_entry(self, message, level, timestamp):
+        color_map = {
+            "ERROR": "red",
+            "WARNING": "yellow",
+            "INFO": "green",
+            "DEBUG": "cyan",
+        }
+        c = color_map.get(level, "white")
+        short_msg = message[:200] + ("..." if len(message) > 200 else "")
+        self.write(f"[{timestamp}] [{level}] {short_msg}", color=c)
+
+
+    def eventFilter(self, obj, event):
+        if obj == self.input_line and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Up:
+                if self.history_pos > 0:
+                    self.history_pos -= 1
+                    self.input_line.setText(self.history[self.history_pos])
+                return True
+            elif event.key() == Qt.Key.Key_Down:
+                if self.history_pos < len(self.history) - 1:
+                    self.history_pos += 1
+                    self.input_line.setText(self.history[self.history_pos])
+                elif self.history_pos == len(self.history) - 1:
+                    self.history_pos = len(self.history)
+                    self.input_line.clear()
+                return True
+            elif event.key() == Qt.Key.Key_Tab:
+                self._tab_complete()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _tab_complete(self):
+        """Tab 键补全命令"""
+        text = self.input_line.text().strip()
+        if not text:
+            return
+        builtin_cmds = ["help", "root", "exit", "quit", "exit()", "quit()",
+                        "read_file", "write_file", "ls", "pwd", "cd", "classes",
+                        "restart", "clear_cache", "perf_info", "close_window",
+                        "open_settings", "backup_config", "theme_info",
+                        "app_info", "list_threads", "gc_collect", "clear"]
+        registered_funcs = [k for k in self.locals.keys() if callable(self.locals.get(k)) and not k.startswith("_")]
+        all_cmds = builtin_cmds + registered_funcs
+        matches = [c for c in all_cmds if c.startswith(text)]
+        if len(matches) == 1:
+            self.input_line.setText(matches[0] + " ")
+        elif len(matches) > 1:
+            self.write("可能的补全:", color="cyan")
+            for m in sorted(matches)[:15]:
+                self.write(f"  {m}", color="white")
+
+    def closeEvent(self, event):
+        set_console_log_callback(None)
+        super().closeEvent(event)
+
     def write(self, text, color="white", newline=True):
         cursor = self.output.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
@@ -4883,10 +5587,11 @@ class DebugConsole(QDialog):
             "magenta": "#cba6f7",
         }
         hex_color = color_map.get(color, "#cdd6f4")
-        html = f'<span style="color:{hex_color};">{text}</span>'
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(hex_color))
+        cursor.insertText(str(text), fmt)
         if newline:
-            html += "<br>"
-        cursor.insertHtml(html)
+            cursor.insertText("\n", fmt)
 
         self.output.setTextCursor(cursor)
         self.output.ensureCursorVisible()
@@ -4908,29 +5613,54 @@ class DebugConsole(QDialog):
         self.history.append(cmd)
         self.history_pos = len(self.history)
 
-        if cmd.lower() == "mrx":
+        cmd_lower = cmd.lower()
+
+        if cmd_lower == "mrx":
             self.write("苗睿轩牛逼 ✨", color="magenta")
-        elif cmd.lower() == "help":
+        elif cmd_lower == "help":
             self.show_help()
-        elif cmd.lower() == "root":
+        elif cmd_lower == "root":
             self._cmd_root()
-        elif cmd.lower() in ("exit", "exit()", "quit", "quit()"):
+        elif cmd_lower in ("exit", "exit()", "quit", "quit()"):
             self.close()
-        elif cmd.lower().startswith("read_file "):
+        elif cmd_lower == "clear":
+            self.output.clear()
+        elif cmd_lower == "restart":
+            self._cmd_restart()
+        elif cmd_lower == "clear_cache":
+            self._cmd_clear_cache()
+        elif cmd_lower == "perf_info":
+            self._cmd_perf_info()
+        elif cmd_lower == "theme_info":
+            self._cmd_theme_info()
+        elif cmd_lower == "app_info":
+            self._cmd_app_info()
+        elif cmd_lower == "list_threads":
+            self._cmd_list_threads()
+        elif cmd_lower == "backup_config":
+            self._cmd_backup_config()
+        elif cmd_lower == "open_settings":
+            self._cmd_open_settings()
+        elif cmd_lower == "toggle_log":
+            self._cmd_toggle_log()
+        elif cmd_lower.startswith("close_window"):
+            arg = cmd[13:].strip()
+            self._cmd_close_window(arg if arg else None)
+        elif cmd_lower.startswith("read_file "):
             self._cmd_read_file(cmd[10:].strip())
-        elif cmd.lower().startswith("write_file "):
+        elif cmd_lower.startswith("write_file "):
             parts = cmd[11:].strip().split(maxsplit=1)
             if len(parts) == 2:
                 self._cmd_write_file(parts[0], parts[1])
             else:
                 self.write_error("用法: write_file <路径> <内容>")
-        elif cmd.lower().startswith("ls "):
+        elif cmd_lower.startswith("ls "):
             self._cmd_ls(cmd[3:].strip() or ".")
-        elif cmd.lower() == "pwd":
+        elif cmd_lower == "pwd":
             self._cmd_pwd()
-        elif cmd.lower().startswith("cd "):
+        elif cmd_lower.startswith("cd "):
             self._cmd_cd(cmd[3:].strip())
-        elif cmd.lower().startswith("classes"):
+        elif cmd_lower.startswith("classes"):
             arg = cmd[7:].strip()
             self._cmd_classes(arg if arg else None)
         else:
@@ -5077,6 +5807,188 @@ class DebugConsole(QDialog):
                     self.write(repr(result), color="magenta")
         except Exception as e:
             self.write_error(f"{type(e).__name__}: {e}")
+
+
+    def _cmd_restart(self):
+        reply = QMessageBox.question(
+            self, "确认重启", "确定要重启应用程序吗？\n所有未保存的更改将先保存。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.write_warning("正在重启应用...")
+            self.close()
+            self.app.restart_application()
+
+    def _cmd_clear_cache(self):
+        """清理缓存"""
+        cache_dirs = []
+        data_dir = self.app.data_dir
+        import shutil
+        cleared = 0
+        cleared_size = 0
+
+        pycache = os.path.join(os.path.dirname(os.path.abspath(__file__)), "__pycache__")
+        if os.path.isdir(pycache):
+            size = sum(os.path.getsize(os.path.join(pycache, f)) for f in os.listdir(pycache) if os.path.isfile(os.path.join(pycache, f)))
+            shutil.rmtree(pycache, ignore_errors=True)
+            cleared += 1
+            cleared_size += size
+
+        for fname in os.listdir(data_dir):
+            if fname.endswith(('.tmp', '.cache', '.bak')):
+                fpath = os.path.join(data_dir, fname)
+                try:
+                    cleared_size += os.path.getsize(fpath)
+                    os.remove(fpath)
+                    cleared += 1
+                except:
+                    pass
+
+        if cleared > 0:
+            self.write_success(f"缓存清理完成：移除了 {cleared} 个项目，释放 {cleared_size / 1024:.1f} KB")
+        else:
+            self.write_info("没有需要清理的缓存")
+
+        # 垃圾回收
+        import gc
+        gc.collect()
+        self.write_info("已执行垃圾回收 (gc.collect)")
+
+    def _cmd_perf_info(self):
+        import threading, gc
+        import time
+
+        self.write("═══ 性能信息 ═══", color="cyan")
+
+        try:
+            import psutil
+            process = psutil.Process()
+            mem = process.memory_info()
+            self.write(f"物理内存: {mem.rss / 1024 / 1024:.1f} MB", color="green")
+            self.write(f"虚拟内存: {mem.vms / 1024 / 1024:.1f} MB", color="green")
+            cpu_percent = process.cpu_percent(interval=0.1)
+            self.write(f"CPU 使用率: {cpu_percent:.1f}%", color="green")
+            self.write(f"线程数: {process.num_threads()}", color="green")
+            self.write(f"打开文件数: {len(process.open_files())}", color="green")
+        except ImportError:
+            self.write_warning("psutil 未安装，无法获取详细性能信息")
+            self.write("提示: pip install psutil 安装后可查看详细性能", color="yellow")
+
+
+        self.write(f"活跃线程数: {threading.active_count()}", color="green")
+        self.write(f"GC 对象计数: {len(gc.get_objects())}", color="green")
+        self.write(f"引用计数阈值: {gc.get_threshold()}", color="green")
+
+        wins = self.app.windows
+        visible = sum(1 for w in wins if w.isVisible())
+        self.write(f"悬浮窗: {visible}/{len(wins)} 可见", color="green")
+
+        try:
+            has_settings = hasattr(self.app, 'settings_dlg') and self.app.settings_dlg and self.app.settings_dlg.isVisible()
+            self.write(f"设置窗口: {'已打开' if has_settings else '已关闭'}", color="green")
+        except RuntimeError:
+            self.write("设置窗口: 已关闭", color="green")
+
+    def _cmd_theme_info(self):
+        """显示当前主题信息"""
+        theme = get_system_theme()
+        c = get_theme_colors(theme)
+        self.write("═══ 主题信息 ═══", color="cyan")
+        self.write(f"系统深色模式: {'是' if is_system_dark() else '否'}", color="green")
+        self.write(f"当前主题名: {theme.name if hasattr(theme, 'name') else '默认'}", color="green")
+        self.write(f"背景色: {theme.bg_color}", color="white")
+        self.write(f"前景色: {theme.fg_color if hasattr(theme, 'fg_color') else 'N/A'}", color="white")
+        self.write(f"强调色: {c.get('accent', 'N/A')}", color="white")
+        self.write(f"控制台背景: {c.get('console_bg', 'N/A')}", color="white")
+        self.write(f"控制台文字: {c.get('console_text', 'N/A')}", color="white")
+        self.write(f"边框色: {c.get('border_color', 'N/A')}", color="white")
+        self.write(f"输入框背景: {c.get('input_bg', 'N/A')}", color="white")
+
+    def _cmd_app_info(self):
+        self.write("═══ 应用信息 ═══", color="cyan")
+        self.write(f"应用版本: {self.app.current_version}", color="green")
+        self.write(f"Python: {sys.version}", color="green")
+        self.write(f"平台: {platform.platform()}", color="green")
+        self.write(f"处理器: {platform.processor()}", color="green")
+        self.write(f"架构: {platform.architecture()[0]}", color="green")
+        self.write(f"数据目录: {self.app.data_dir}", color="green")
+        self.write(f"配置文件: {self.app.config_path}", color="green")
+        self.write(f"工作目录: {os.getcwd()}", color="green")
+        self.write(f"是否打包: {'是' if getattr(sys, 'frozen', False) else '否（开发模式）'}", color="green")
+        self.write(f"DEBUG_MODE: {DEBUG_MODE}", color="green")
+
+        projects = self.app.projects
+        self.write(f"项目数: {len(projects)}", color="green")
+
+        pm = self.app.plugin_manager
+        enabled = sum(1 for p in pm.plugins if p.enabled)
+        self.write(f"插件: {enabled}/{len(pm.plugins)} 已启用", color="green")
+
+        self.write(f"Qt 版本: {qVersion()}", color="green")
+        self.write(f"PyQt 版本: {PYQT_VERSION_STR}", color="green")
+
+    def _cmd_list_threads(self):
+        import threading
+        self.write("═══ 活跃线程 ═══", color="cyan")
+        for t in threading.enumerate():
+            daemon = "守护" if t.daemon else "普通"
+            alive = "运行中" if t.is_alive() else "已停止"
+            self.write(f"  [{daemon}] {t.name} ({alive})", color="white")
+        self.write(f"共 {threading.active_count()} 个线程", color="green")
+
+    def _cmd_backup_config(self):
+        config_path = self.app.config_path
+        if not os.path.exists(config_path):
+            self.write_error(f"配置文件不存在: {config_path}")
+            return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_dir = os.path.join(self.app.data_dir, "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        backup_path = os.path.join(backup_dir, f"config_backup_{timestamp}.json")
+        try:
+            import shutil
+            shutil.copy2(config_path, backup_path)
+            self.write_success(f"配置已备份到: {backup_path}")
+            # 列出所有备份
+            backups = sorted([f for f in os.listdir(backup_dir) if f.startswith("config_backup_")], reverse=True)
+            if len(backups) > 1:
+                self.write(f"历史备份 ({len(backups)} 个):", color="cyan")
+                for b in backups[:5]:
+                    self.write(f"  {b}", color="white")
+        except Exception as e:
+            self.write_error(f"备份失败: {e}")
+
+    def _cmd_open_settings(self):
+        self.write_info("正在打开设置窗口...")
+        self.app.open_settings()
+
+    def _cmd_toggle_log(self):
+        new_state = not self.log_forward_enabled
+        self.log_toggle.setChecked(new_state)
+        self._on_log_toggle_changed(
+            Qt.CheckState.Checked.value if new_state else Qt.CheckState.Unchecked.value
+        )
+
+    def _cmd_close_window(self, index_str):
+        wins = self.app.windows
+        if not index_str:
+            self.write("当前悬浮窗:", color="cyan")
+            for i, w in enumerate(wins):
+                status = "可见" if w.isVisible() else "隐藏"
+                self.write(f"  [{i}] {w.project.name} ({status})", color="white")
+            self.write_info("用法: close_window <索引>")
+            return
+        try:
+            idx = int(index_str)
+            if 0 <= idx < len(wins):
+                w = wins[idx]
+                name = w.project.name
+                w.close()
+                self.write_success(f"已关闭悬浮窗 [{idx}] {name}")
+            else:
+                self.write_error(f"索引超出范围 (0-{len(wins)-1})")
+        except ValueError:
+            self.write_error(f"无效索引: {index_str}")
 
     def _register_commands(self):
         self.locals = {
@@ -5357,78 +6269,106 @@ class DebugConsole(QDialog):
 
     def show_help(self):
         help_text = """
-    ====================== 控制台命令列表 ======================
+  ╔══════════════════════════ 控制台命令列表 ═══════════════════════════╗
+  ║  版本: V1.0.4
+  ╚══════════════════════════════════════════════════════════════════╝
 
-    【窗口操作】
-      list_windows()          - 列出所有悬浮窗
-      show_windows()          - 显示所有悬浮窗
-      hide_windows()          - 隐藏所有悬浮窗
-      refresh_windows()       - 刷新所有悬浮窗
-      set_window_alpha(值)    - 设置透明度
-      get_focused_window()    - 获取焦点控件
+  ┌──【内建命令】（直接输入，无需括号）────────────────────────────┐
+  │  help             显示此帮助文档                      
+  │  clear            清空控制台输出                      
+  │  root             提升权限（需管理员）                   
+  │  exit / quit      关闭控制台                        
+  │  restart          重启应用程序（会先保存配置）               
+  │  clear_cache      清理缓存 + 垃圾回收                  
+  │  perf_info        显示性能信息（内存/CPU/线程/窗口）         
+  │  app_info         显示应用详细信息（版本/路径/Qt/Python）    
+  │  theme_info       显示当前主题配色详情                   
+  │  list_threads     列出所有活跃线程                     
+  │  backup_config    备份当前配置文件到 backups/ 目录        
+  │  open_settings    打开设置窗口                       
+  │  close_window [N] 关闭指定悬浮窗（不传参数列出所有窗口）        
+  │  toggle_log       切换日志转发开关（同顶部复选框）             
+  │  read_file <路径> 读取文件内容（最多显示 5000 字符）           
+  │  write_file <路径> <内容>  写入文件                    
+  │  ls [路径]        列出目录内容                         
+  │  pwd              显示当前工作目录                     
+  │  cd <目录>        切换工作目录                         
+  │  classes [类名]   列出所有类 / 查看类的继承链和方法             
+  └───────────────────────────────────────────────────────────┘
 
-    【项目管理】
-      list_projects()         - 列出所有项目
-      current_project(索引)   - 查看/设置当前项目
-      dump_project(索引)      - 打印项目配置
+  ┌──【窗口操作】──────────────────────────────────────────────────┐
+  │  list_windows()        列出所有悬浮窗                       
+  │  show_windows()        显示所有悬浮窗                       
+  │  hide_windows()        隐藏所有悬浮窗                       
+  │  refresh_windows()     刷新所有悬浮窗                       
+  │  set_window_alpha(0.8) 设置悬浮窗透明度 (0.1~1.0)            
+  │  get_focused_window()  获取当前焦点控件                      
+  └───────────────────────────────────────────────────────────────┘
 
-    【配置与主题】
-      save_config()           - 保存配置
-      reload_theme()          - 重新加载主题
-      set_debug_level(0-3)    - 设置调试等级
+  ┌──【项目管理】──────────────────────────────────────────────────┐
+  │  list_projects()       列出所有项目                          
+  │  current_project(N)    查看/设置当前项目                       
+  │  dump_project(N)       打印项目完整配置 (JSON)                 
+  └──────────────────────────────────────────────────────────────┘
 
-    【插件管理】
-      plugins()               - 列出插件
-      enable_plugin("名称")   - 启用插件
-      disable_plugin("名称")  - 禁用插件
-      reload_plugins()        - 重载插件
+  ┌──【配置与主题】────────────────────────────────────────────────┐
+  │  save_config()         保存配置                               
+  │  reload_theme()        重新加载主题                             
+  │  set_debug_level(N)    设置调试等级 (0=关闭 1=错误 2=信息 3=详细)
+  │  backup_config         备份当前配置                             
+  └─────────────────────────────────────────────────────────────┘
 
-    【系统信息与权限】
-      sys_info()              - 系统信息
-      get_username()          - 当前用户名
-      check_admin()           - 检查管理员权限
-      get_screen_info()       - 屏幕信息
-      check_disk_space(路径)  - 磁盘空间
-      get_env(变量名)         - 环境变量
+  ┌──【插件管理】──────────────────────────────────────────────────┐
+  │  plugins()             列出所有插件（含权限状态）               
+  │  enable_plugin("名")   启用指定插件                            
+  │  disable_plugin("名")  禁用指定插件                            
+  │  reload_plugins()      重新加载所有插件                         
+  │  plugin_mgr()          打开增强插件管理器                       
+  └─────────────────────────────────────────────────────────────┘
 
-    【日志与调试】
-      log("消息", "级别")     - 写入日志
-      show_log(行数)          - 显示日志
-      clear_log()             - 清空日志
-      exec_code("代码")       - 执行代码
-      clear_screen()          - 清屏
-      refresh_weather()       - 刷新天气
-      test_notification()     - 测试通知
+  ┌──【系统与性能】────────────────────────────────────────────────┐
+  │  sys_info()            系统基本信息                           
+  │  get_username()        当前用户名                            
+  │  check_admin()         检查管理员权限                          
+  │  get_screen_info()     屏幕分辨率/DPI                        
+  │  check_disk_space()    磁盘剩余空间                           
+  │  get_env("PATH")       查看环境变量                           
+  │  perf_info             性能概览（需 psutil）                   
+  │  list_threads          活跃线程列表                           
+  └──────────────────────────────────────────────────────────────┘
 
-    【文件与目录】  <-- 部分命令需权限
-      read_file <路径>        - 读取文件
-      write_file <路径> <内容> - 写入文件
-      ls [路径]               - 列出目录
-      pwd                     - 显示当前目录
-      cd <目录>               - 切换目录
+  ┌──【日志操作】──────────────────────────────────────────────────┐
+  │  log("msg","INFO")     手动写入日志            
+  │  show_log(50)          显示最近 N 行日志        
+  │  clear_log()           清空日志文件            
+  │  clear_screen()        清空控制台显示           
+  │  clear                 清屏（内建命令）          
+  │  toggle_log            切换日志实时转发到控制台      
+  │  📋 顶部复选框         开启/关闭日志转发（默认关闭防刷屏）      
+  └──────────────────────────────────────────────────────────────┘
 
-    【类结构查看】
-      classes                 - 列出所有类
-      classes <对象名>        - 显示类继承链和方法
+  ┌──【其他工具】──────────────────────────────────────────────────┐
+  │  refresh_weather()     强制刷新天气                           
+  │  test_notification()   发送测试系统通知                       
+  │  exec_code("代码")     执行任意 Python 代码                   
+  │  restart               重启应用                               
+  │  exit / quit           退出应用                               
+  └─────────────────────────────────────────────────────────────┘
 
-    【权限提升】
-      root                    - 似乎没什么用
-
-    【其他】
-      restart()               - 重启应用
-      exit()                  - 退出应用
-      help                    - 帮助
-      clear                   - 清屏
-
-    任意 Python 表达式/语句均可执行，如: 1+2, len(app.windows)
-    =============================================================
+  ┌──【快捷操作提示】──────────────────────────────────────────────┐
+  │  ↑↓  浏览命令历史                                         
+  │  Tab 命令自动补全                                         
+  │  任意 Python 表达式均可执行: 1+2, len(app.windows), dir(app) 
+  │  app.windows[0].project.name  获取第一个窗口的项目名           
+  └─────────────────────────────────────────────────────────────┘
+  ══════════════════════════════════════════════════════════════════
     """
         for line in help_text.splitlines():
             self.write(line, color="white")
 
     def _show_welcome(self):
         username = getpass.getuser()
-        self.write(f"Python {sys.version.split()[0]}  Countdown 调试控制台", color="cyan")
+        self.write(f"Python {sys.version.split()[0]}  Countdown 调试控制台 V1.0.4", color="cyan")
         self.write(f"用户: {username}", color="yellow")
 
         if username.lower() == "guzhi":
@@ -5439,7 +6379,8 @@ class DebugConsole(QDialog):
         else:
             self.write_warning("保留有限权限")
 
-        self.write("输入 'help' 查看命令列表 当前控制器版本V1.0.2 build_version:2026614", color="green")
+        self.write(f"日志转发: {'开启（日志会实时显示）' if self.log_forward_enabled else '关闭（推荐：防止刷屏）'}", color="green")
+        self.write("输入 'help' 查看命令列表 | ↑↓ 历史 | Tab 补全 | 版本: V2.0.0", color="green")
         self.write(">>> ", newline=False)
 
     def keyPressEvent(self, event):
@@ -5509,15 +6450,12 @@ class HelpTab(QWidget):
             self.nav_tree.setCurrentItem(self.nav_tree.topLevelItem(0))
 
     def build_help_data(self):
-        """构建多级帮助目录（内容充实）"""
-        # 快速入门
         quick = QTreeWidgetItem(["🚀 快速入门"])
         QTreeWidgetItem(quick, ["📌 欢迎与概览"])
         QTreeWidgetItem(quick, ["🖱️ 悬浮窗操作指南"])
         QTreeWidgetItem(quick, ["⚙️ 第一次使用设置"])
         self.nav_tree.addTopLevelItem(quick)
 
-        # 项目管理
         proj = QTreeWidgetItem(["📁 项目管理"])
         QTreeWidgetItem(proj, ["➕ 创建项目"])
         QTreeWidgetItem(proj, ["✏️ 编辑项目"])
@@ -5525,7 +6463,6 @@ class HelpTab(QWidget):
         QTreeWidgetItem(proj, ["🗑️ 删除项目"])
         self.nav_tree.addTopLevelItem(proj)
 
-        # 深度定制
         appearance = QTreeWidgetItem(["🎨 深度定制"])
         QTreeWidgetItem(appearance, ["🖼️ 背景类型详解"])
         QTreeWidgetItem(appearance, ["📝 文字元素样式"])
@@ -5548,7 +6485,6 @@ class HelpTab(QWidget):
         QTreeWidgetItem(plugin, ["🛡️ 沙箱与审计"])
         self.nav_tree.addTopLevelItem(plugin)
 
-        # 安全与调试
         security = QTreeWidgetItem(["🔒 安全与调试"])
         QTreeWidgetItem(security, ["📜 权限最佳实践"])
         QTreeWidgetItem(security, ["📝 敏感操作审计"])
@@ -5556,7 +6492,6 @@ class HelpTab(QWidget):
         QTreeWidgetItem(security, ["📄 日志等级与查看"])
         self.nav_tree.addTopLevelItem(security)
 
-        # 常见问题
         faq = QTreeWidgetItem(["❓ 常见问题"])
         QTreeWidgetItem(faq, ["❔ 窗口/倒计时问题"])
         QTreeWidgetItem(faq, ["❔ 天气/网络问题"])
@@ -5564,14 +6499,12 @@ class HelpTab(QWidget):
         QTreeWidgetItem(faq, ["❔ 动态壁纸优化"])
         self.nav_tree.addTopLevelItem(faq)
 
-        # 快捷键
         shortcuts = QTreeWidgetItem(["⌨️ 快捷键与技巧"])
         QTreeWidgetItem(shortcuts, ["🖱️ 鼠标操作速查"])
         QTreeWidgetItem(shortcuts, ["⌨️ 键盘快捷键"])
         QTreeWidgetItem(shortcuts, ["💡 效率小技巧"])
         self.nav_tree.addTopLevelItem(shortcuts)
 
-        # 关于
         about = QTreeWidgetItem(["ℹ️ 关于"])
         QTreeWidgetItem(about, ["📦 版本信息"])
         QTreeWidgetItem(about, ["👨‍💻 致谢与贡献"])
@@ -5893,25 +6826,57 @@ def setup(app, api):
             """,
             "🐞 调试控制台完全指南": """
             <h2>🐞 调试控制台完全指南</h2>
-            <p>在设置界面按下键盘上的 <code>~</code> 或 <code>`</code> 键即可打开内置的调试控制台。这是一个交互式 Python 环境，可以实时执行代码、查看和修改应用状态。</p>
-            <h3>常用命令示例：</h3>
-            <pre><code>
-list_windows()        # 列出所有悬浮窗
-show_windows()        # 显示所有悬浮窗
-hide_windows()        # 隐藏所有悬浮窗
-set_window_alpha(0.8) # 设置所有窗口透明度
-list_projects()       # 列出所有项目
-dump_project(0)       # 打印第一个项目的完整配置
-reload_theme()        # 重新加载主题
-plugins()             # 列出所有插件
-enable_plugin("Hello World")  # 启用指定插件
-disable_plugin("StockPlugin") # 禁用插件
-set_debug_level(3)    # 设置日志等级为详细调试
-refresh_weather()     # 强制刷新所有窗口的天气
-clear_screen()        # 清空控制台输出
-exit()                # 退出调试控制台
-            </code></pre>
-            <p>控制台还支持任意 Python 表达式，例如 <code>len(app.windows)</code>、<code>app.theme.is_dark</code> 等。</p>
+            <p>在设置界面按下键盘上的 <code>~</code> 或 <code>`</code> 键即可打开内置的调试控制台（V2.0）。这是一个强大的交互式 Python 环境，支持命令行历史、Tab 自动补全和 20+ 内置调试命令。</p>
+            <h3>界面说明</h3>
+            <ul>
+              <li><b>日志转发开关</b>：工具栏上的复选框，默认<b>关闭</b>，避免日志刷屏。开启后系统日志将实时显示在控制台中</li>
+              <li><b>↑↓ 方向键</b>：浏览历史命令，方便重复执行</li>
+              <li><b>Tab 键</b>：自动补全命令名，输入前几个字母按 Tab 即可</li>
+              <li><b>清空/帮助按钮</b>：一键清屏或查看所有命令</li>
+            </ul>
+            <h3>内置命令一览</h3>
+            <table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse; width:100%;'>
+              <tr style='background:#3498db; color:white;'><th>命令</th><th>参数</th><th>功能说明</th></tr>
+              <tr><td><code>help</code></td><td>-</td><td>显示完整的命令帮助列表</td></tr>
+              <tr><td><code>clear</code></td><td>-</td><td>清空控制台输出内容</td></tr>
+              <tr><td><code>restart</code></td><td>-</td><td>重新启动整个应用程序</td></tr>
+              <tr><td><code>clear_cache</code></td><td>-</td><td>清理应用缓存（天气、背景等临时数据）</td></tr>
+              <tr><td><code>perf_info</code></td><td>-</td><td>显示性能统计：窗口数、线程数、内存占用</td></tr>
+              <tr><td><code>theme_info</code></td><td>-</td><td>显示当前主题详细信息（名称、色值、模式）</td></tr>
+              <tr><td><code>app_info</code></td><td>-</td><td>显示应用版本、Python版本、系统环境信息</td></tr>
+              <tr><td><code>list_threads</code></td><td>-</td><td>列出所有活跃线程及其状态</td></tr>
+              <tr><td><code>backup_config</code></td><td>-</td><td>备份当前配置文件到 backups/ 目录</td></tr>
+              <tr><td><code>open_settings</code></td><td>-</td><td>快速打开全局设置窗口</td></tr>
+              <tr><td><code>toggle_log</code></td><td>-</td><td>切换日志转发开关（开/关）</td></tr>
+              <tr><td><code>close_window</code></td><td>&lt;N&gt;</td><td>关闭第 N 个悬浮窗（从0开始编号）</td></tr>
+              <tr><td><code>list_windows</code></td><td>-</td><td>列出所有悬浮窗的索引和名称</td></tr>
+              <tr><td><code>show_windows</code></td><td>-</td><td>显示所有悬浮窗</td></tr>
+              <tr><td><code>hide_windows</code></td><td>-</td><td>隐藏所有悬浮窗</td></tr>
+              <tr><td><code>set_window_alpha</code></td><td>&lt;0.1-1.0&gt;</td><td>设置所有窗口的全局透明度</td></tr>
+              <tr><td><code>list_projects</code></td><td>-</td><td>列出所有项目名称和目标日期</td></tr>
+              <tr><td><code>dump_project</code></td><td>&lt;N&gt;</td><td>打印第 N 个项目的完整配置（JSON）</td></tr>
+              <tr><td><code>reload_theme</code></td><td>-</td><td>重新加载主题样式表</td></tr>
+              <tr><td><code>plugins</code></td><td>-</td><td>列出所有已装载的插件</td></tr>
+              <tr><td><code>enable_plugin</code></td><td>&lt;名称&gt;</td><td>启用指定名称的插件</td></tr>
+              <tr><td><code>disable_plugin</code></td><td>&lt;名称&gt;</td><td>禁用指定名称的插件</td></tr>
+              <tr><td><code>set_debug_level</code></td><td>&lt;0-3&gt;</td><td>设置全局调试等级（0=关闭, 1=错误, 2=信息, 3=详细）</td></tr>
+              <tr><td><code>refresh_weather</code></td><td>-</td><td>强制刷新所有窗口的天气信息</td></tr>
+              <tr><td><code>exit</code></td><td>-</td><td>关闭调试控制台窗口</td></tr>
+            </table>
+            <h3>高级用法</h3>
+            <p>控制台支持任意 Python 表达式求值，输入后按回车即可执行。例如：</p>
+            <pre><code>len(app.windows)          # 查看当前悬浮窗数量
+app.theme.is_dark          # 检查是否为暗色主题
+app.projects[0].name       # 查看第一个项目的名称
+[x.project.name for x in app.windows]  # 列表推导式</code></pre>
+            <p>如果命令不是内置的，控制台会尝试用 <code>eval()</code> 求值，因此你可以访问所有以 <code>app</code> 开头的对象属性和方法。</p>
+            <h3>注意事项</h3>
+            <ul>
+              <li>日志转发默认关闭——执行命令的输出不会被日志冲刷掉</li>
+              <li>修改应用状态的命令会立即生效（如 set_window_alpha、set_debug_level）</li>
+              <li><code>restart</code> 会关闭所有窗口并重新加载，请确认已保存</li>
+              <li><code>close_window N</code> 会彻底删除对应的悬浮窗，操作不可撤销</li>
+            </ul>
             """,
             "📄 日志等级与查看": """
             <h2>📄 日志等级与查看方法</h2>
@@ -6074,7 +7039,7 @@ class CountdownApp(QApplication):
         self.setApplicationName(tr("app_title"))
         self.setQuitOnLastWindowClosed(False)
 
-        self.current_version = "2.8.1"
+        self.current_version = "2.8.2"
         self.build_version = 101
         self.python_version = sys.version.split()[0]
         self.global_font = "Microsoft YaHei"
@@ -6092,6 +7057,9 @@ class CountdownApp(QApplication):
         self.plugin_monitor = False
         self.plugin_prompt_on_deny = True
         self.global_disable_all_plugins = False
+
+        self.weather_provider = "wttr_in"
+        self.custom_weather_url = ""
 
         self.dynamic_bg_registry = {"stars": "✨ 星空", "clouds": "☁️ 白云", "particles": "🌌 鼠标粒子"}
         self.dynamic_bg_classes = {}
@@ -6288,6 +7256,8 @@ class CountdownApp(QApplication):
                 self.plugin_monitor = config.get("plugin_monitor", False)
                 self.plugin_prompt_on_deny = config.get("plugin_prompt_on_deny", True)
                 self.global_disable_all_plugins = config.get("global_disable_all_plugins", False)
+                self.weather_provider = config.get("weather_provider", "wttr_in")
+                self.custom_weather_url = config.get("custom_weather_url", "")
 
                 def _decode_geom(hex_str):
                     return QByteArray.fromHex(hex_str.encode('utf-8')) if hex_str else None
@@ -6334,7 +7304,11 @@ class CountdownApp(QApplication):
         plugin_states = {}
         if hasattr(self, 'plugin_manager'):
             for plugin in self.plugin_manager.plugins:
-                plugin_states[plugin.filename] = {"enabled": plugin.enabled, "limited": plugin.limited}
+                plugin_states[plugin.filename] = {
+                    "enabled": plugin.enabled,
+                    "limited": plugin.limited,
+                    "permissions": int(plugin.permissions)
+                }
 
         def _encode_geom(geom):
             return geom.toHex().data().decode('utf-8') if geom else None
@@ -6352,6 +7326,8 @@ class CountdownApp(QApplication):
             "plugin_monitor": self.plugin_monitor,
             "plugin_prompt_on_deny": self.plugin_prompt_on_deny,
             "global_disable_all_plugins": self.global_disable_all_plugins,
+            "weather_provider": self.weather_provider,
+            "custom_weather_url": self.custom_weather_url,
             "plugin_states": plugin_states,
             "settings_geometry": _encode_geom(self.settings_geometry),
             "editor_geometry": _encode_geom(self.editor_geometry),
@@ -6378,6 +7354,13 @@ class CountdownApp(QApplication):
                 states = config.get("plugin_states", {})
                 for plugin in self.plugin_manager.plugins:
                     state = states.get(plugin.filename, {})
+                    if "permissions" in state:
+                        try:
+                            plugin.permissions = PluginPermission(int(state["permissions"]))
+                        except Exception:
+                            plugin.permissions = plugin.requested_permissions
+                    elif state.get("enabled", False):
+                        plugin.permissions = plugin.requested_permissions
                     if state.get("enabled", False):
                         self.plugin_manager.enable_plugin(plugin, limited=state.get("limited", False), force=True)
             except Exception as e:
@@ -6409,48 +7392,152 @@ class CountdownApp(QApplication):
 
     def start_console_debugger(self):
         def console_loop():
-            print(">>> 开发调试控制台已启动，输入 'help' 查看可用命令")
+            print("=" * 60)
+            print("  倒计时 (Countdown) - 开发调试控制台 V2.0.0")
+            print("  输入 'help' 查看可用命令")
+            print("=" * 60)
             while True:
                 try:
                     cmd = input("dj>>> ").strip()
                     if not cmd:
                         continue
                     if cmd == "help":
-                        print("可用命令:")
-                        print("  help          - 显示此帮助")
-                        print("  p             - 打印所有项目信息")
-                        print("  w             - 打印所有窗口信息")
-                        print("  reload        - 重新加载配置并刷新窗口")
-                        print("  exit/quit     - 退出调试控制台")
-                        print("  其他任意Python表达式，例如: self.projects")
+                        print("""
+  可用命令:
+    help           - 显示此帮助
+    p              - 打印所有项目信息
+    w              - 打印所有窗口信息
+    reload         - 重新加载配置并刷新窗口
+    restart        - 重启应用
+    info           - 显示应用基本信息
+    screen         - 显示屏幕信息
+    theme          - 显示主题信息
+    threads        - 列出活跃线程
+    perf           - 性能概览（需 psutil）
+    backup         - 备份当前配置文件
+    log [N]        - 显示最近 N 行日志（默认 30）
+    clearlog       - 清空日志文件
+    plugins        - 列出所有插件
+    exit / quit    - 退出调试控制台
+    也支持任意 Python 表达式: self.projects, len(self.windows)
+  """)
                         continue
                     if cmd in ("exit", "quit"):
                         print("调试控制台已关闭")
                         break
                     if cmd == "p":
-                        for proj in self.projects:
-                            print(f"  {proj.name}  {proj.target_date} {proj.target_time}")
+                        for i, proj in enumerate(self.projects):
+                            print(f"  [{i}] {proj.name}  目标: {proj.target_date} {proj.target_time}")
                         continue
                     if cmd == "w":
-                        for w in self.windows:
-                            print(f"  {w.project.name} pos={w.x()},{w.y()} size={w.width()}x{w.height()}")
+                        for i, w in enumerate(self.windows):
+                            vis = "可见" if w.isVisible() else "隐藏"
+                            print(f"  [{i}] {w.project.name} pos=({w.x()},{w.y()}) size={w.width()}x{w.height()} [{vis}]")
                         continue
                     if cmd == "reload":
                         self.save_config(force=True)
                         self.load_config()
                         self.create_windows()
-                        print("配置已重载")
+                        print("配置已重载，窗口已刷新")
+                        continue
+                    if cmd == "restart":
+                        print("正在重启应用...")
+                        self.restart_application()
+                        break
+                    if cmd == "info":
+                        print(f"  版本: {self.current_version}")
+                        print(f"  Python: {sys.version}")
+                        print(f"  平台: {platform.platform()}")
+                        print(f"  数据目录: {self.data_dir}")
+                        print(f"  项目数: {len(self.projects)}")
+                        print(f"  悬浮窗: {len(self.windows)}")
+                        continue
+                    if cmd == "screen":
+                        screen = QApplication.primaryScreen()
+                        geom = screen.geometry()
+                        avail = screen.availableGeometry()
+                        dpi = screen.logicalDotsPerInch()
+                        print(f"  分辨率: {geom.width()}x{geom.height()}")
+                        print(f"  可用区域: {avail.width()}x{avail.height()}")
+                        print(f"  DPI: {dpi:.1f}")
+                        continue
+                    if cmd == "theme":
+                        theme = get_system_theme()
+                        dark = is_system_dark()
+                        print(f"  系统深色模式: {'是' if dark else '否'}")
+                        print(f"  背景色: {theme.bg_color}")
+                        print(f"  DEBUG_MODE: {DEBUG_MODE}")
+                        continue
+                    if cmd == "threads":
+                        import threading
+                        for t in threading.enumerate():
+                            d = "守护" if t.daemon else "普通"
+                            a = "运行中" if t.is_alive() else "已停止"
+                            print(f"  [{d}] {t.name} ({a})")
+                        print(f"  共 {threading.active_count()} 个线程")
+                        continue
+                    if cmd == "perf":
+                        try:
+                            import psutil
+                            proc = psutil.Process()
+                            mem = proc.memory_info()
+                            print(f"  物理内存: {mem.rss / 1024 / 1024:.1f} MB")
+                            print(f"  虚拟内存: {mem.vms / 1024 / 1024:.1f} MB")
+                            print(f"  CPU: {proc.cpu_percent(interval=0.1):.1f}%")
+                            print(f"  线程数: {proc.num_threads()}")
+                        except ImportError:
+                            print("  psutil 未安装，无法获取性能信息")
+                        import gc
+                        print(f"  活跃线程: {threading.active_count()}")
+                        print(f"  GC对象数: {len(gc.get_objects())}")
+                        continue
+                    if cmd == "backup":
+                        config_path = self.config_path
+                        if os.path.exists(config_path):
+                            import shutil
+                            backup_dir = os.path.join(self.data_dir, "backups")
+                            os.makedirs(backup_dir, exist_ok=True)
+                            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            bp = os.path.join(backup_dir, f"config_backup_{ts}.json")
+                            shutil.copy2(config_path, bp)
+                            print(f"  配置已备份到: {bp}")
+                        else:
+                            print("  配置文件不存在")
+                        continue
+                    if cmd.startswith("log"):
+                        parts = cmd.split()
+                        n = int(parts[1]) if len(parts) > 1 else 30
+                        log_file = os.path.join(self.data_dir, "LOG.txt")
+                        if os.path.exists(log_file):
+                            with open(log_file, "r", encoding="utf-8") as f:
+                                lines = f.readlines()
+                            for line in lines[-n:]:
+                                print(line.rstrip())
+                        else:
+                            print("  日志文件不存在")
+                        continue
+                    if cmd == "clearlog":
+                        log_file = os.path.join(self.data_dir, "LOG.txt")
+                        with open(log_file, "w", encoding="utf-8") as f:
+                            f.write("")
+                        print("  日志已清空")
+                        continue
+                    if cmd == "plugins":
+                        pm = self.plugin_manager
+                        for p in pm.plugins:
+                            status = "启用" if p.enabled else "禁用"
+                            print(f"  {p.name} v{p.version} [{status}]")
                         continue
                     try:
-                        result = eval(cmd, {"self": self, "app": self})
+                        result = eval(cmd, {"self": self, "app": self, "os": os, "sys": sys, "json": json})
                         if result is not None:
                             print(result)
                     except Exception as e:
-                        print(f"错误: {e}")
+                        print(f"  错误: {e}")
                 except EOFError:
                     break
                 except Exception as e:
-                    print(f"输入异常: {e}")
+                    print(f"  输入异常: {e}")
 
         t = threading.Thread(target=console_loop, daemon=True)
         t.start()
@@ -6477,14 +7564,35 @@ class CountdownApp(QApplication):
                 pass
 
     def append_sensitive_log(self, plugin_name, operation, detail=""):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = f"[{timestamp}] [{plugin_name}] {operation}"
+        if detail:
+            msg += f" | {detail}"
+        if not hasattr(self, '_sensitive_log_entries'):
+            self._sensitive_log_entries = []
+        self._sensitive_log_entries.append(msg)
+        if len(self._sensitive_log_entries) > 500:
+            del self._sensitive_log_entries[:-500]
+        if threading.current_thread() is not threading.main_thread():
+            return
         def _append():
-            if hasattr(self, 'sensitive_log_text'):
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                msg = f"[{timestamp}] [{plugin_name}] {operation}"
-                if detail:
-                    msg += f" | {detail}"
-                self.sensitive_log_text.appendPlainText(msg)
+            try:
+                w = getattr(self, 'sensitive_log_text', None)
+                if w is not None:
+                    w.appendPlainText(msg)
+            except RuntimeError:
+                pass
         QTimer.singleShot(0, _append)
+
+    def _clear_sensitive_log(self):
+        if hasattr(self, '_sensitive_log_entries'):
+            self._sensitive_log_entries.clear()
+        try:
+            w = getattr(self, 'sensitive_log_text', None)
+            if w is not None:
+                w.clear()
+        except RuntimeError:
+            pass
 
 
 
@@ -6524,11 +7632,6 @@ class CountdownApp(QApplication):
         self.quit()
 
     def register_settings_tab(self, name: str, widget_factory, enabled=True):
-        """注册一个新的设置选项卡
-        name: 选项卡显示名称
-        widget_factory: 可调用对象，接受 parent 参数，返回 QWidget
-        enabled: 是否启用
-        """
         self.plugin_settings_tabs[name] = (widget_factory, enabled)
 
     def register_settings_tab(self, name: str, widget_factory, enabled=True):
@@ -6586,10 +7689,18 @@ class CountdownApp(QApplication):
         for tab_name, (widget_factory, enabled) in self.plugin_settings_tabs.items():
             if enabled:
                 try:
-                    tab_widget = widget_factory(self.settings_dlg)  # 传入父窗口
+                    tab_widget = widget_factory(self.settings_dlg)
                     tabs.addTab(tab_widget, tab_name)
                 except Exception as e:
                     log_message(f"加载插件选项卡 {tab_name} 失败: {e}", "ERROR")
+
+        def wrap_in_scroll(widget):
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(widget)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+            return scroll
 
         tab_proj = QWidget()
         layout_proj = QVBoxLayout(tab_proj)
@@ -6625,7 +7736,7 @@ class CountdownApp(QApplication):
             lambda: btn_custom.setEnabled(len(self.list_proj.selectedItems()) > 0)
         )
 
-        tabs.addTab(tab_proj, tr("project_management"))
+        tabs.addTab(wrap_in_scroll(tab_proj), tr("project_management"))
 
         tab_global = QWidget()
         layout_global = QVBoxLayout(tab_global)
@@ -6679,12 +7790,17 @@ class CountdownApp(QApplication):
             self.update_thread.start()
 
         self.btn_check_update.clicked.connect(on_check_update_clicked)
+
+        btn_vote = QPushButton(tr("feature_vote"))
+        btn_vote.setProperty("primary", True)
+        btn_vote.clicked.connect(lambda: webbrowser.open("https://gitcode.com/2401_86556713/djs/discussions"))
+        lay_info.addWidget(btn_vote)
+
         layout_global.addWidget(grp_info)
 
         grp_basic = QGroupBox(tr("global_settings"))
         lay_basic = QVBoxLayout(grp_basic)
 
-        # 在 grp_basic 添加完成后，增加以下区域
         grp_debug = QGroupBox("🐛 调试与日志")
         lay_debug = QVBoxLayout(grp_debug)
 
@@ -6721,9 +7837,47 @@ class CountdownApp(QApplication):
         poem_lay.addWidget(self.combo_poem)
         lay_basic.addLayout(poem_lay)
 
+        lang_lay = QHBoxLayout()
+        lang_lay.addWidget(QLabel(tr("language_label") + ":"))
+        self.combo_lang = QComboBox()
+        self.combo_lang.addItems(["🇨🇳 中文", "🇬🇧 English"])
+        self.combo_lang.setCurrentIndex(0 if CURRENT_LANG == LANG_CHINESE else 1)
+        self.combo_lang.currentIndexChanged.connect(self._on_language_changed)
+        lang_lay.addWidget(self.combo_lang)
+        lay_basic.addLayout(lang_lay)
+
         layout_global.addWidget(grp_basic)
+
+        # 天气API配置
+        grp_weather = QGroupBox(tr("weather_source"))
+        lay_weather = QVBoxLayout(grp_weather)
+
+        weather_src_lay = QHBoxLayout()
+        weather_src_lay.addWidget(QLabel(tr("weather_source") + ":"))
+        self.combo_weather_source = QComboBox()
+        self.combo_weather_source.addItems(["wttr.in (" + tr("default") + ")", "Open-Meteo", tr("custom")])
+        provider_map = {"wttr_in": 0, "open_meteo": 1, "custom": 2}
+        self.combo_weather_source.setCurrentIndex(provider_map.get(self.weather_provider, 0))
+        self.combo_weather_source.currentIndexChanged.connect(self._on_weather_source_changed)
+        weather_src_lay.addWidget(self.combo_weather_source)
+        lay_weather.addLayout(weather_src_lay)
+
+        self.weather_custom_url_row = QWidget()
+        custom_url_lay = QHBoxLayout(self.weather_custom_url_row)
+        custom_url_lay.setContentsMargins(0, 0, 0, 0)
+        custom_url_lay.addWidget(QLabel(tr("custom_url") + ":"))
+        self.edit_custom_weather_url = QLineEdit()
+        self.edit_custom_weather_url.setPlaceholderText("https://api.example.com/weather?city={city}")
+        self.edit_custom_weather_url.setText(self.custom_weather_url)
+        self.edit_custom_weather_url.textChanged.connect(self._on_weather_url_changed)
+        custom_url_lay.addWidget(self.edit_custom_weather_url)
+        lay_weather.addWidget(self.weather_custom_url_row)
+        self.weather_custom_url_row.setVisible(self.weather_provider == "custom")
+
+        layout_global.addWidget(grp_weather)
+
         layout_global.addStretch()
-        tabs.addTab(tab_global, tr("global_settings"))
+        tabs.addTab(wrap_in_scroll(tab_global), tr("global_settings"))
 
         tab_plugin = QWidget()
         plugin_main_layout = QVBoxLayout(tab_plugin)
@@ -6740,7 +7894,6 @@ class CountdownApp(QApplication):
         top_row.addStretch()
         plugin_main_layout.addWidget(self.plugin_header_widget)
 
-        # 介绍界面（禁用时显示）
         self.plugin_intro_widget = QWidget()
         intro_card = QFrame()
         intro_card.setStyleSheet(f"""
@@ -6809,13 +7962,11 @@ class CountdownApp(QApplication):
         intro_inner.addStretch()
         plugin_main_layout.addWidget(self.plugin_intro_widget)
 
-        # 插件管理主界面（启用时显示）
         self.plugin_management_widget = QWidget()
         mgmt_layout = QVBoxLayout(self.plugin_management_widget)
         mgmt_layout.setContentsMargins(0, 0, 0, 0)
         mgmt_layout.setSpacing(10)
 
-        # 左右分栏
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         left_widget = QWidget()
@@ -6938,16 +8089,16 @@ class CountdownApp(QApplication):
         self.sensitive_log_text = QPlainTextEdit()
         self.sensitive_log_text.setReadOnly(True)
         self.sensitive_log_text.setMaximumBlockCount(200)
+        self.sensitive_log_text.setPlainText("\n".join(getattr(self, '_sensitive_log_entries', [])))
         log_page2_layout.addWidget(self.sensitive_log_text)
         btn_clear_sensitive = QPushButton("清空记录")
-        btn_clear_sensitive.clicked.connect(lambda: self.sensitive_log_text.clear())
+        btn_clear_sensitive.clicked.connect(self._clear_sensitive_log)
         log_page2_layout.addWidget(btn_clear_sensitive)
         log_tabs.addTab(log_page2, "敏感操作")
 
         log_combined_layout.addWidget(log_tabs)
         right_layout.addWidget(self.log_combined_frame)
 
-        # Plugin settings panels
         tc = get_theme_colors(self.theme)
         self.plugin_panels_group = QGroupBox("Plugin Settings")
         self.plugin_panels_group.setStyleSheet(
@@ -7002,10 +8153,10 @@ class CountdownApp(QApplication):
         self.tree_plugins.model().rowsInserted.connect(lambda: self.empty_table_label.setVisible(self.tree_plugins.topLevelItemCount() == 0))
         self.tree_plugins.model().rowsRemoved.connect(lambda: self.empty_table_label.setVisible(self.tree_plugins.topLevelItemCount() == 0))
 
-        tabs.addTab(tab_plugin, "插件管理")
+        tabs.addTab(wrap_in_scroll(tab_plugin), "插件管理")
 
         self.tab_help = HelpTab(self)
-        tabs.addTab(self.tab_help, tr("help"))
+        tabs.addTab(wrap_in_scroll(self.tab_help), tr("help"))
 
         main_layout.addWidget(tabs)
 
@@ -7035,6 +8186,12 @@ class CountdownApp(QApplication):
     def _refresh_plugin_panels(self):
         self.plugin_panels_list.clear()
         panels = getattr(self, "plugin_settings_panels", {})
+        if self.global_disable_all_plugins:
+            panels = {}
+        else:
+            enabled_names = {p.name for p in self.plugin_manager.plugins if p.enabled}
+            panels = {pid: info for pid, info in panels.items()
+                      if not info.get("plugin") or info.get("plugin") in enabled_names}
         if not panels:
             self.plugin_panels_list.addItem("(No registered panels)")
             self.plugin_panels_group.setVisible(False)
@@ -7053,6 +8210,12 @@ class CountdownApp(QApplication):
         panel_info = panels.get(panel_id)
         if not panel_info:
             return
+        panel_plugin = panel_info.get("plugin")
+        if panel_plugin:
+            plugin_obj = next((p for p in self.plugin_manager.plugins if p.name == panel_plugin), None)
+            if self.global_disable_all_plugins or not plugin_obj or not plugin_obj.enabled:
+                QMessageBox.warning(self.settings_dlg, "Error", "该面板所属插件已禁用，无法打开")
+                return
         panel_class = panel_info.get("class")
         if not panel_class:
             QMessageBox.warning(self.settings_dlg, "Error", "Panel class not found")
@@ -7089,27 +8252,31 @@ class CountdownApp(QApplication):
         if hasattr(self, 'log_combined_frame'):
             self.log_combined_frame.setVisible(enabled)
         if not enabled:
-            if hasattr(self, 'log_text'):
-                self.log_text.clear()
-            if hasattr(self, 'sensitive_log_text'):
-                self.sensitive_log_text.clear()
+            try:
+                if hasattr(self, 'log_text'):
+                    self.log_text.clear()
+                if hasattr(self, 'sensitive_log_text'):
+                    self.sensitive_log_text.clear()
+            except RuntimeError:
+                pass
         self._refresh_plugin_panels()
 
     def toggle_global_disable_plugins(self, checked):
         self.global_disable_all_plugins = not checked
-        if self.global_disable_all_plugins:
-            for p in self.plugin_manager.get_enabled_plugins():
-                self.plugin_manager.disable_plugin(p)
         self.save_config(force=True)
         self._update_plugin_ui_state()
 
     def enable_plugin_system(self):
         self.global_disable_all_plugins = False
         self.save_config(force=True)
+        self._load_plugins_and_restore()
         self._update_plugin_ui_state()
+        try:
+            self.refresh_plugin_list()
+        except (RuntimeError, AttributeError):
+            pass
 
     def on_plugin_selected(self):
-        """更新插件详情面板"""
         item = self.tree_plugins.currentItem()
         if not item:
             self.detail_label.setText("请选择插件")
@@ -7138,8 +8305,24 @@ class CountdownApp(QApplication):
         while self.plugin_custom_widget.count():
             self.plugin_custom_widget.removeWidget(self.plugin_custom_widget.widget(0))
 
+        if self.global_disable_all_plugins or not plugin.enabled:
+            disabled_lbl = QLabel("🔒 该插件当前处于禁用状态，其功能与设置面板不可用。")
+            disabled_lbl.setWordWrap(True)
+            disabled_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            disabled_lbl.setStyleSheet(
+                f"color: {get_theme_colors(self.theme)['secondary_text']}; padding: 20px;")
+            self.plugin_custom_widget.addWidget(disabled_lbl)
+            return
+
         if hasattr(plugin, 'get_info_widget'):
-            custom_w = plugin.get_info_widget(self.settings_dlg)
+            _plugin_context.current_plugin = plugin
+            try:
+                custom_w = plugin.get_info_widget(self.settings_dlg)
+            except Exception as e:
+                plugin.log_plugin(f"构建设置面板失败: {e}", "ERROR")
+                custom_w = None
+            finally:
+                _plugin_context.current_plugin = None
             if custom_w:
                 self.plugin_custom_widget.addWidget(custom_w)
 
@@ -7286,6 +8469,27 @@ class CountdownApp(QApplication):
             self.create_windows()
             self.save_config(force=True)
 
+    def _on_weather_source_changed(self, index):
+        provider_map = {0: "wttr_in", 1: "open_meteo", 2: "custom"}
+        self.weather_provider = provider_map.get(index, "wttr_in")
+        self.weather_custom_url_row.setVisible(self.weather_provider == "custom")
+        self._apply_weather_config_to_windows()
+        self.save_config(force=True)
+
+    def _on_weather_url_changed(self, text):
+        self.custom_weather_url = text.strip()
+        if self.weather_provider == "custom":
+            self._apply_weather_config_to_windows()
+        self.save_config(force=True)
+
+    def _apply_weather_config_to_windows(self):
+        """将天气配置应用到所有窗口并刷新"""
+        for w in self.windows:
+            if hasattr(w, 'weather_fetcher') and w.weather_fetcher:
+                w.weather_fetcher.api_provider = self.weather_provider
+                w.weather_fetcher.custom_url_template = self.custom_weather_url
+                w.weather_fetcher.fetch(w.project.weather_city)
+
     def auto_save_global_settings(self, _=None):
         index = self.combo_poem.currentIndex()
         if index == 0:
@@ -7332,6 +8536,22 @@ class CountdownApp(QApplication):
                 winreg.CloseKey(key)
         except Exception as e:
             log_message(f"设置开机自启动失败: {e}", "ERROR")
+
+    def _on_language_changed(self, index):
+        global CURRENT_LANG
+        new_lang = LANG_CHINESE if index == 0 else LANG_ENGLISH
+        if new_lang == CURRENT_LANG:
+            return
+        CURRENT_LANG = new_lang
+        self.save_config(force=True)
+        for win in self.windows:
+            win.init_menu()
+            win.update_countdown()
+        QMessageBox.information(
+            self.settings_dlg if hasattr(self, 'settings_dlg') and self.settings_dlg else None,
+            tr("language_label"),
+            "语言已切换，部分界面将在重启后完全生效。\nLanguage changed. Some UI will update after restart."
+        )
 
 if __name__ == "__main__":
     import sys
