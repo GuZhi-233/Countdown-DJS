@@ -1,6 +1,7 @@
 # 倒计时桌面 · 多功能桌面悬浮倒计时工具
 
 **当前版本：2.8.2**  
+![2.8.2.jpg](https://raw.gitcode.com/user-images/assets/10122757/e73b9ce3-959e-4a10-a4cf-236e97f4f182/2.8.2.jpg '2.8.2.jpg')
 **安装程序下载：[点击下载](https://1823222148.share.123pan.cn/123pan/tM3gjv-9rwJA)**  
 旧版下载：[点击下载](https://1823222148.share.123pan.cn/123pan/tM3gjv-SFGwA)
 
