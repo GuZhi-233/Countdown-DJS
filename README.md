@@ -1,6 +1,6 @@
 # 倒计时·DJS多功能桌面悬浮倒计时工具
 
-**当前版本：2.8.2**  
+**当前版本：2.8.3beta**  
 ![2.8.3Beta.png](https://raw.gitcode.com/user-images/assets/10122757/e0f20447-2750-480b-89b7-a1350a992446/2.8.3Beta.png '2.8.3Beta.png')
 **安装程序下载：[点击下载](https://1823222148.share.123pan.cn/123pan/tM3gjv-9rwJA)**  
 旧版下载：[点击下载](https://1823222148.share.123pan.cn/123pan/tM3gjv-SFGwA)
