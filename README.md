@@ -1,8 +1,14 @@
 # 倒计时·DJS多功能桌面悬浮倒计时工具
 
-**当前版本：2.9.0 RC1**
+**当前公开版本：2.9.0 RC1**
 
 ![2.9.0.png](https://raw.gitcode.com/user-images/assets/10122757/fc4c78b5-572d-406e-9081-94ac5f9fc195/2.9.0.png '2.9.0.png')
+---
+<span style="background-color:#e60000;">  <span style="font-size:48px;">**须知：**</span></span>
+**由于学业原因 本项目下一个大版本延迟更新 当前最新的rc1预发布版存在未知bug 如遭遇bug 请反馈至邮箱 2835531424@qq.com  或 guzhiawa@qq.com  我会争取在下一个版本修复**
+
+*当前正在开发中的版本:3.0.8Alpha 内部版本号115  敬请期待*
+
 
 ---
 
