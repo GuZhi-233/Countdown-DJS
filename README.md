@@ -10,7 +10,7 @@
 
 > <span style="background-color:#e60000;"><span style="font-size:24px;">***须知***</span></span>
 > 本项目由个人开发维护，若遇到 Bug，请反馈至邮箱：2835531424@qq.com 或 guzhiawa@qq.com。  
-> 下一个大版本正在开发中，敬请期待。
+> 下一个大版本正在开发中，敬请期待。（注意：由于学业问题 开发进度缓慢）
 
 ---
 
