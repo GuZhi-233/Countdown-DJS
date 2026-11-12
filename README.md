@@ -29,6 +29,8 @@
 
 ### 外观与布局
 
+<img src="docs/images/hero_banner.jpg" alt="倒计时桌面" width="100%">
+
 - 纯色、图片、渐变、动态壁纸、壁纸轮播五种背景。
 - 星空、鼠标粒子、极光、天空、潮汐五种动态背景，优先使用 OpenGL + GLSL。
 - 可视化布局编辑器：拖拽、缩放、网格吸附、层级调整、键盘微调。
@@ -46,6 +48,11 @@
 - CAC 插件系统：动态背景、桌面挂件、设置页、卡片插槽、事件钩子。
 - 插件运行在独立子进程，权限分为基础权限与按需权限。
 - 安全中心记录拦截、放行、文件操作与插件日志，支持信任模式与白名单。
+
+<p align="center">
+  <img src="docs/images/security_center_dark.png" alt="安全中心深色" width="49%">
+  <img src="docs/images/security_center_light.png" alt="安全中心浅色" width="49%">
+</p>
 
 <img src="docs/images/plugin_system.jpg" alt="插件系统" width="100%">
 
