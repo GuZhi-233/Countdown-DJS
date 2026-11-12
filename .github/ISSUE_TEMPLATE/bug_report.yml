@@ -1,0 +1,62 @@
+name: Bug 反馈
+description: 报告主程序运行时遇到的问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先搜索已有 Issue，并确认使用的是最新版本。
+        日志文件位于程序目录的 `data/LOG.txt`。
+  - type: input
+    id: version
+    attributes:
+      label: 主程序版本
+      description: 设置 → 关于 / 版本信息中的版本号与构建号
+      placeholder: 例如 4.5.5 / 20261112A
+    validations:
+      required: true
+  - type: dropdown
+    id: system
+    attributes:
+      label: Windows 版本
+      options:
+        - Windows 11
+        - Windows 10
+        - Windows 8.1
+        - Windows 7
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 请按顺序写出能稳定复现问题的操作
+      placeholder: |
+        1. 打开...
+        2. 点击...
+        3. 出现...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果与实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志与截图
+      description: 粘贴 `data/LOG.txt` 中的相关片段，或拖入截图
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 确认
+      options:
+        - label: 我已确认使用的是最新版本
+          required: true
+        - label: 我已搜索过已有 Issue
+          required: true
