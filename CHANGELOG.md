@@ -21,6 +21,10 @@
 
 - 默认安装路径改为 `C:\DJS`，需要管理员权限。
 - 安装前提示“如果安装失败，请尝试关闭安全软件”。
+- 主程序改为 PyInstaller 单文件打包，`data` 目录仍随安装包安装。
+- `DJS.exe` 与安装包补全 FileDescription、ProductName、FileVersion、OriginalFilename 等版本信息。
+- 使用本地自签名证书对 `DJS.exe` 与安装包签名；该证书未经过受信任 CA，不能替代正式代码签名证书。
+- 针对火绒 `Trojan/Python.ShellLoader.am` 误报补充说明并准备反馈材料。
 
 ## 4.5.4 - 2026-11-12
 
