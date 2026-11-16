@@ -11,7 +11,7 @@
 
 # 倒计时 · DJS
 
-上课前 2 分钟，桌面上的悬浮窗会展开提醒；下课时间到，按项目设置播放提示音。每个倒计时项目是一张独立悬浮窗，位置、大小、字体和背景分别保存。当前版本 <span style="color:#1F883D"><b>4.8.3</b></span>，运行在 <span style="color:#1F883D">Windows 10 / 11 x64</span>。
+上课前 2 分钟，桌面上的悬浮窗会展开提醒；下课时间到，按项目设置播放提示音。每个倒计时项目是一张独立悬浮窗，位置、大小、字体和背景分别保存。当前版本 <span style="color:#1F883D"><b>4.8.4</b></span>，运行在 <span style="color:#1F883D">Windows 10 / 11 x64</span>。
 
 > ZX 插件、Windows / Android 远控控制台放在附属仓库：
 > **[Countdown-DJS-Addons](https://github.com/GuZhi-233/Countdown-DJS-Addons)**  
@@ -173,7 +173,7 @@ python src/djs_pyqt6.py
 升级版本号：
 
 ```bash
-python tools/bump_version.py 4.8.4
+python tools/bump_version.py 4.8.5
 ```
 
 构建 Windows 安装包与便携版（需要 PyInstaller 和 Inno Setup 6）：
@@ -202,6 +202,11 @@ powershell -ExecutionPolicy Bypass -File tools/package/build_main.ps1
 ## 更新日志
 
 完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+
+### 4.8.4
+
+- 修复安装路径含“·”时复选框勾选状态、下拉箭头与滚动箭头显示异常。
+- 修复反复开关插件系统或安全中心后插件启用无效、界面不注册的问题。
 
 ### 4.8.3
 

@@ -856,8 +856,8 @@ def apply_menu_style(menu, tc):
 def _theme_scrollbar_qss(c, is_dark):
     _up = _ensure_scroll_arrow_asset(is_dark, up=True)
     _down = _ensure_scroll_arrow_asset(is_dark, up=False)
-    _up_rule = f"image: url({_up}); width: 10px; height: 10px;" if _up else ""
-    _down_rule = f"image: url({_down}); width: 10px; height: 10px;" if _down else ""
+    _up_rule = f'image: url("{_up}"); width: 10px; height: 10px;' if _up else ""
+    _down_rule = f'image: url("{_down}"); width: 10px; height: 10px;' if _down else ""
     return (
         f"QScrollBar:vertical {{ background: {c['panel_bg']}; width: 10px; margin: 0; border: none; }}"
         f"QScrollBar::handle:vertical {{ background: {c['border_color']}; border-radius: 4px;"
@@ -901,12 +901,12 @@ def _perm_secondary_qss(c):
 def get_theme_qss(t):
     c = get_theme_colors(t)
     _check_url = _ensure_check_indicator_asset()
-    _check_rule = f"image: url({_check_url});" if _check_url else ""
+    _check_rule = f'image: url("{_check_url}");' if _check_url else ""
     _caret_down = _ensure_caret_asset(t.is_dark, up=False)
     _caret_up = _ensure_caret_asset(t.is_dark, up=True)
-    _caret_down_rule = f"image: url({_caret_down}); width: 10px; height: 10px;" if _caret_down else ""
-    _caret_up_rule = f"image: url({_caret_up}); width: 9px; height: 9px;" if _caret_up else ""
-    _caret_down_small = f"image: url({_caret_down}); width: 9px; height: 9px;" if _caret_down else ""
+    _caret_down_rule = f'image: url("{_caret_down}"); width: 10px; height: 10px;' if _caret_down else ""
+    _caret_up_rule = f'image: url("{_caret_up}"); width: 9px; height: 9px;' if _caret_up else ""
+    _caret_down_small = f'image: url("{_caret_down}"); width: 9px; height: 9px;' if _caret_down else ""
     _scroll = _theme_scrollbar_qss(c, t.is_dark)
 
     return f"""
@@ -6856,6 +6856,7 @@ class PluginManager(QObject):
         self._host_starting = False
         self._host_output_tail = ""
         self._host_loading = False
+        self._host_registering = False
         self._host_pending_registrations = []
         self._host_caller_tokens = {}
         self._host_job = None
@@ -7712,6 +7713,8 @@ class PluginManager(QObject):
         plugin = next((p for p in self.plugins if p.filename == plugin_file), None)
         if plugin is None:
             return bool(getattr(self, "_host_loading", False))
+        if getattr(self, "_host_registering", False):
+            return True
         if self.app.global_disable_all_plugins or not getattr(plugin, "enabled", False):
             return False
         try:
@@ -7952,12 +7955,15 @@ class PluginManager(QObject):
             elif not getattr(self.app, "global_disable_all_plugins", False):
                 self.report_register_error(plugin_file, f"注册失败: 插件未加载 (ID={id_name})")
             return
-        if self.app.global_disable_all_plugins or not getattr(plugin, "enabled", False):
+        if self.app.global_disable_all_plugins:
             return
-        if not self.require_permission(PluginPermission.UI_INJECT, f"host.register.{kind}",
-                                       "缺少界面注入权限（宿主注册）", plugin):
-            self.report_register_error(plugin.name, f"注册失败: 缺少界面注入权限 (ID={id_name})")
-            return
+        if not getattr(self, "_host_registering", False):
+            if not getattr(plugin, "enabled", False):
+                return
+            if not self.require_permission(PluginPermission.UI_INJECT, f"host.register.{kind}",
+                                           "缺少界面注入权限（宿主注册）", plugin):
+                self.report_register_error(plugin.name, f"注册失败: 缺少界面注入权限 (ID={id_name})")
+                return
         display_name = str(params.get("name") or id_name)
         if kind == "float_widget":
             size = params.get("size")
@@ -8551,12 +8557,13 @@ class PluginManager(QObject):
             except Exception:
                 states = {}
         grants = {}
+        old_plugins = list(self.plugins)
         for key, value in self._auth_perms.items():
             try:
                 grants[key] = int(value)
             except Exception:
                 pass
-        for plugin in self.plugins:
+        for plugin in old_plugins:
             if getattr(plugin, "filename", None):
                 grants[plugin.filename] = int(getattr(plugin, "permissions", 0) or 0)
         only = None
@@ -8569,7 +8576,9 @@ class PluginManager(QObject):
                             only.append(filename)
             except Exception:
                 only = []
+        self.plugins = []
         self._host_loading = True
+        self._host_registering = True
         self._host_pending_registrations = []
         self._host_caller_tokens = {}
         try:
@@ -8587,9 +8596,12 @@ class PluginManager(QObject):
         if not response or response.get("error") or not isinstance(response.get("result"), dict):
             if response and response.get("error"):
                 log_message(f"[插件宿主] 加载失败: {response.get('error')}", "ERROR")
+            self.plugins = old_plugins
             self._host_pending_registrations = []
+            self._host_registering = False
             return None
         result = response["result"]
+        QTimer.singleShot(1200, self._finish_host_registration_window)
         self.plugins = []
         for meta in result.get("plugins") or []:
             if not isinstance(meta, dict):
@@ -8606,6 +8618,20 @@ class PluginManager(QObject):
             except Exception:
                 pass
         return [str(x) for x in (result.get("errors") or [])]
+
+    def _finish_host_registration_window(self):
+        self._host_registering = False
+        pending = self._host_pending_registrations
+        self._host_pending_registrations = []
+        for params in pending:
+            try:
+                self._register_remote_widget(params)
+            except Exception:
+                pass
+        try:
+            self._refresh_plugin_surfaces()
+        except Exception:
+            pass
 
     def plugin_host_new_widget_token(self):
         self._host_widget_seq += 1
@@ -8702,10 +8728,26 @@ class PluginManager(QObject):
         }})
 
     def plugin_host_enable(self, filename):
-        self._send_host({"method": "enable_plugin", "params": {"plugin": filename}})
+        if not self._host_connected():
+            return False
+        response = self._request_host({
+            "method": "enable_plugin",
+            "params": {"plugin": filename},
+        }, timeout_ms=8000)
+        if not response or response.get("error"):
+            return False
+        return bool(response.get("result"))
 
     def plugin_host_disable(self, filename):
-        self._send_host({"method": "disable_plugin", "params": {"plugin": filename}})
+        if not self._host_connected():
+            return False
+        response = self._request_host({
+            "method": "disable_plugin",
+            "params": {"plugin": filename},
+        }, timeout_ms=8000)
+        if not response or response.get("error"):
+            return False
+        return bool(response.get("result"))
 
     def plugin_host_event(self, name, filename, args, kwargs):
         self._send_host({"method": "event", "params": {
@@ -8841,6 +8883,9 @@ class PluginManager(QObject):
                     self._host_proc.waitForFinished(1500)
             except Exception:
                 pass
+            self._host_proc = None
+        self._host_ready = False
+        self._host_loading = False
         if self._host_socket is not None:
             try:
                 self._host_socket.close()
@@ -10980,6 +11025,19 @@ class PluginManager(QObject):
             return
         if plugin.enabled and not force:
             return
+        filename = getattr(plugin, "filename", None)
+        if getattr(plugin, "remote", False) and not self._host_connected():
+            log_message("[插件] 宿主未连接，正在重新加载插件", "WARNING")
+            self._load_plugins_from_host()
+            fresh = next((p for p in self.plugins if p.filename == filename), None)
+            if fresh is None or not self._host_connected():
+                plugin.enabled = False
+                plugin.enable_error = "插件宿主未连接，无法启用"
+                log_message(f"[插件] {filename} 启用失败: 插件宿主未连接", "ERROR")
+                self.save_security_config()
+                self.app.save_config(force=True)
+                return
+            plugin = fresh
         locked_before = self.effective_permissions(plugin)
         if not force:
             baseline = PluginPermission(int(
@@ -11037,6 +11095,17 @@ class PluginManager(QObject):
             except Exception as e:
                 plugin.enable_error = str(e)
                 plugin.log_plugin(perm_text("perm_enable_failed", error=e), "ERROR")
+                if getattr(plugin, "remote", False) and not self._host_connected():
+                    plugin.enabled = False
+                    try:
+                        plugin.permissions = self.permanent_permissions(plugin)
+                    except Exception:
+                        pass
+                    _plugin_context.current_plugin = None
+                    self.save_security_config()
+                    self.app.save_config(force=True)
+                    log_message(f"[插件] {plugin.filename} 启用失败: {e}", "ERROR")
+                    return
             finally:
                 try:
                     plugin.permissions = self.permanent_permissions(plugin)
@@ -11749,14 +11818,16 @@ class RemotePlugin(Plugin):
     def on_enable(self):
         _audit_guard.active = True
         try:
-            self._manager.plugin_host_enable(self.filename)
+            if not self._manager.plugin_host_enable(self.filename):
+                raise RuntimeError("插件宿主未连接或启用失败")
         finally:
             _audit_guard.active = False
 
     def on_disable(self):
         _audit_guard.active = True
         try:
-            self._manager.plugin_host_disable(self.filename)
+            if not self._manager.plugin_host_disable(self.filename):
+                raise RuntimeError("插件宿主未连接或停用失败")
         finally:
             _audit_guard.active = False
 
@@ -36445,6 +36516,12 @@ class PluginSecurityCenterDialog(QDialog):
         except Exception:
             pass
         try:
+            manager = self.app.plugin_manager
+            if not self.app.global_disable_all_plugins and not manager._host_connected():
+                QTimer.singleShot(0, self.app._load_plugins_and_restore)
+        except Exception:
+            pass
+        try:
             self.app.append_sensitive_log("安全中心", "重新开启安全防护", "用户操作")
             self.app.append_security_event("安全中心", "allow", "security_center",
                                            "重新开启安全防护", "用户操作")
@@ -37542,8 +37619,8 @@ class CountdownApp(QApplication):
         install_qt_translations()
         self.setQuitOnLastWindowClosed(False)
 
-        self.current_version = "4.8.3"
-        self.build_version = "20261116"
+        self.current_version = "4.8.4"
+        self.build_version = "20261116A"
         self.python_version = sys.version.split()[0]
         self.global_font = "Microsoft YaHei"
         self.current_theme = "system"
@@ -38711,7 +38788,7 @@ class CountdownApp(QApplication):
 
         plugin_states = {}
         if hasattr(self, 'plugin_manager'):
-            if getattr(self.plugin_manager, '_plugins_loaded', False):
+            if getattr(self.plugin_manager, '_plugins_loaded', False) and self.plugin_manager.plugins:
                 for plugin in self.plugin_manager.plugins:
                     plugin_states[plugin.filename] = {
                         "enabled": plugin.enabled,
@@ -38789,6 +38866,9 @@ class CountdownApp(QApplication):
         if self.global_disable_all_plugins:
             return
         if getattr(self, "_plugins_loading", False):
+            if not getattr(self, "_plugins_retry_pending", False):
+                self._plugins_retry_pending = True
+                QTimer.singleShot(900, self._retry_load_plugins_after_busy)
             return
         self._plugins_loading = True
         try:
@@ -38815,6 +38895,11 @@ class CountdownApp(QApplication):
             self.refresh_plugin_float_widgets()
         finally:
             self._plugins_loading = False
+
+    def _retry_load_plugins_after_busy(self):
+        self._plugins_retry_pending = False
+        if not self.global_disable_all_plugins:
+            self._load_plugins_and_restore()
 
     def _plugin_widget_enabled(self, widget_id):
         classes = getattr(self, "dynamic_bg_classes", {}) or {}
@@ -40862,8 +40947,8 @@ class CountdownApp(QApplication):
 
     def enable_plugin_system(self):
         self.global_disable_all_plugins = False
-        self.save_config(force=True)
         self._load_plugins_and_restore()
+        self.save_config(force=True)
         self._update_plugin_ui_state()
         try:
             self.refresh_plugin_list()
