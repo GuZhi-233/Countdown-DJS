@@ -37,6 +37,8 @@ import sys
 import threading
 import time
 import traceback
+import types
+import weakref
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,6 +47,7 @@ try:
     import winreg
 except ImportError:
     winreg = None
+from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from enum import IntFlag, auto
 
@@ -103,7 +106,7 @@ except ImportError:
     HAS_OPENGL_41 = False
     HAS_OPENGL_21 = False
 
-SUPPORTED_CONFIG_VERSION = 9
+SUPPORTED_CONFIG_VERSION = 11
 
 
 PROVINCE_CITY_DATA = {
@@ -1532,8 +1535,438 @@ def localize_holiday_name(name):
     return name
 
 
-def calculate_days(target_date, target_time="00:00"):
-    today = datetime.now()
+WORK_SCHEDULE_PRESETS = {
+    "standard": {
+        "name": "标准白领",
+        "use_chinese_calendar": True,
+        "workdays": [0, 1, 2, 3, 4],
+        "periods": [
+            {"start": "09:00", "end": "12:00"},
+            {"start": "13:00", "end": "18:00"},
+        ],
+    },
+    "student": {
+        "name": "学生",
+        "use_chinese_calendar": True,
+        "workdays": [0, 1, 2, 3, 4],
+        "periods": [
+            {"start": "08:00", "end": "12:00"},
+            {"start": "14:00", "end": "17:00"},
+        ],
+    },
+    "day_shift": {
+        "name": "白班",
+        "use_chinese_calendar": False,
+        "workdays": [0, 1, 2, 3, 4, 5, 6],
+        "periods": [
+            {"start": "08:00", "end": "20:00"},
+        ],
+    },
+    "night_shift": {
+        "name": "夜班",
+        "use_chinese_calendar": False,
+        "workdays": [0, 1, 2, 3, 4, 5, 6],
+        "periods": [
+            {"start": "00:00", "end": "08:00"},
+            {"start": "20:00", "end": "24:00"},
+        ],
+    },
+    "freelance": {
+        "name": "自由职业",
+        "use_chinese_calendar": False,
+        "workdays": [0, 1, 2, 3, 4, 5, 6],
+        "periods": [
+            {"start": "00:00", "end": "24:00"},
+        ],
+    },
+}
+
+
+def _clock_to_minutes(value):
+    text = str(value or "").strip()
+    if text == "24:00":
+        return 1440
+    parts = text.split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+    except (TypeError, ValueError):
+        return None
+    if hours < 0 or hours > 23 or minutes < 0 or minutes > 59:
+        return None
+    return hours * 60 + minutes
+
+
+def _minutes_to_clock(value):
+    minutes = max(0, min(1440, int(value)))
+    if minutes == 1440:
+        return "24:00"
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def _default_work_schedule():
+    base = WORK_SCHEDULE_PRESETS["standard"]
+    return {
+        "preset": "standard",
+        "use_chinese_calendar": bool(base["use_chinese_calendar"]),
+        "workdays": list(base["workdays"]),
+        "periods": [dict(item) for item in base["periods"]],
+    }
+
+
+def normalize_work_schedule(data, fallback=None):
+    base = _default_work_schedule()
+    source = fallback if isinstance(fallback, dict) and fallback else base
+    if isinstance(data, dict) and data:
+        source = data
+    preset = str(source.get("preset") or "custom")
+    use_calendar = bool(source.get("use_chinese_calendar", base["use_chinese_calendar"]))
+    raw_days = source.get("workdays")
+    workdays = []
+    if isinstance(raw_days, (list, tuple)):
+        for item in raw_days:
+            try:
+                day = int(item)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= day <= 6 and day not in workdays:
+                workdays.append(day)
+    if not workdays:
+        workdays = list(base["workdays"])
+    raw_periods = source.get("periods")
+    periods = []
+    if isinstance(raw_periods, (list, tuple)):
+        for item in raw_periods[:8]:
+            if not isinstance(item, dict):
+                continue
+            start = _clock_to_minutes(item.get("start"))
+            end = _clock_to_minutes(item.get("end"))
+            if start is None or end is None or end <= start:
+                continue
+            periods.append({"start": _minutes_to_clock(start), "end": _minutes_to_clock(end)})
+    if not periods:
+        periods = [dict(item) for item in base["periods"]]
+    workdays = sorted(workdays)
+    if preset == "custom":
+        for preset_id, preset_data in WORK_SCHEDULE_PRESETS.items():
+            if (sorted(preset_data["workdays"]) == workdays
+                    and bool(preset_data["use_chinese_calendar"]) == use_calendar
+                    and [dict(item) for item in preset_data["periods"]] == periods):
+                preset = preset_id
+                break
+    return {
+        "preset": preset,
+        "use_chinese_calendar": use_calendar,
+        "workdays": workdays,
+        "periods": periods,
+    }
+
+
+def resolve_work_schedule(project, app=None):
+    override = getattr(project, "work_schedule_override", None)
+    if isinstance(override, dict) and override:
+        return normalize_work_schedule(override)
+    global_schedule = getattr(app, "work_schedule", None) if app is not None else None
+    return normalize_work_schedule(global_schedule, _default_work_schedule())
+
+
+def schedule_daily_seconds(schedule):
+    total = 0
+    for item in (schedule or {}).get("periods", []):
+        start = _clock_to_minutes(item.get("start"))
+        end = _clock_to_minutes(item.get("end"))
+        if start is not None and end is not None and end > start:
+            total += (end - start) * 60
+    return max(0, min(86400, total))
+
+
+def schedule_signature(schedule):
+    return json.dumps(normalize_work_schedule(schedule), ensure_ascii=False, sort_keys=True)
+
+
+def is_schedule_workday(schedule, day):
+    workdays = (schedule or {}).get("workdays") or [0, 1, 2, 3, 4]
+    if (schedule or {}).get("use_chinese_calendar", False):
+        try:
+            import chinese_calendar
+            return bool(chinese_calendar.is_workday(day))
+        except NotImplementedError:
+            return day.weekday() in workdays
+        except Exception:
+            return day.weekday() in workdays
+    return day.weekday() in workdays
+
+
+def _holiday_detail(day):
+    try:
+        import chinese_calendar
+        return chinese_calendar.get_holiday_detail(day)
+    except Exception:
+        return (False, "")
+
+
+def compute_work_metrics(now, target, schedule):
+    daily_seconds = schedule_daily_seconds(schedule)
+    if target <= now or daily_seconds <= 0:
+        holiday_name = ""
+        on_holiday, name = _holiday_detail(now.date())
+        if on_holiday and name:
+            holiday_name = localize_holiday_name(name)
+        return {
+            "work_seconds": 0.0,
+            "work_days": 0,
+            "work_days_float": 0.0,
+            "daily_seconds": daily_seconds,
+            "holiday_name": holiday_name,
+        }
+    work_seconds = 0.0
+    holiday_name = ""
+    on_today, today_holiday = _holiday_detail(now.date())
+    if on_today and today_holiday:
+        holiday_name = localize_holiday_name(today_holiday)
+    current = now.date()
+    last = target.date()
+    while current <= last:
+        if is_schedule_workday(schedule, current):
+            for item in (schedule or {}).get("periods", []):
+                start = _clock_to_minutes(item.get("start"))
+                end = _clock_to_minutes(item.get("end"))
+                if start is None or end is None or end <= start:
+                    continue
+                period_start = datetime.combine(current, datetime.min.time()) + timedelta(minutes=start)
+                period_end = datetime.combine(current, datetime.min.time()) + timedelta(minutes=end)
+                seg_start = max(period_start, now)
+                seg_end = min(period_end, target)
+                if seg_end > seg_start:
+                    work_seconds += (seg_end - seg_start).total_seconds()
+        elif not holiday_name:
+            on_holiday, name = _holiday_detail(current)
+            if on_holiday and name:
+                holiday_name = localize_holiday_name(name)
+        current += timedelta(days=1)
+    work_days_float = work_seconds / daily_seconds if daily_seconds else 0.0
+    return {
+        "work_seconds": max(0.0, work_seconds),
+        "work_days": int(work_seconds // daily_seconds) if daily_seconds else 0,
+        "work_days_float": work_days_float,
+        "daily_seconds": daily_seconds,
+        "holiday_name": holiday_name,
+    }
+
+
+_WORK_METRICS_CACHE = {}
+_WORK_METRICS_CACHE_LOCK = threading.Lock()
+_WORK_METRICS_CACHE_MAX = 256
+
+
+def _cached_work_metrics(now, target, schedule):
+    key = (
+        schedule_signature(schedule),
+        target.strftime("%Y-%m-%d %H:%M"),
+        now.strftime("%Y-%m-%d %H:%M"),
+    )
+    with _WORK_METRICS_CACHE_LOCK:
+        cached = _WORK_METRICS_CACHE.get(key)
+        if cached is not None:
+            return dict(cached)
+    result = compute_work_metrics(now, target, schedule)
+    with _WORK_METRICS_CACHE_LOCK:
+        if len(_WORK_METRICS_CACHE) >= _WORK_METRICS_CACHE_MAX:
+            for old_key in list(_WORK_METRICS_CACHE.keys())[:64]:
+                _WORK_METRICS_CACHE.pop(old_key, None)
+        _WORK_METRICS_CACHE[key] = dict(result)
+    return result
+
+
+@dataclass
+class CountdownSnapshot:
+    target: object = None
+    now: object = None
+    total_seconds: float = 0.0
+    remaining_days: float = 0.0
+    natural_days: int = 0
+    hours: int = 0
+    minutes: int = 0
+    seconds: int = 0
+    work_seconds: float = 0.0
+    work_days: int = 0
+    work_days_float: float = 0.0
+    daily_hours: float = 0.0
+    holiday_name: str = ""
+    elapsed_days: object = None
+    overdue_seconds: float = 0.0
+    expired: bool = False
+    display_text: str = ""
+    display_unit: str = ""
+    uses_seconds: bool = False
+    static_text: str = ""
+
+
+def _parse_date_value(value):
+    try:
+        return datetime.strptime(str(value or "").strip(), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def format_elapsed_seconds(seconds):
+    total = max(0, int(seconds))
+    days = total // 86400
+    hours = (total % 86400) // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    if days > 0:
+        return f"{days}天 {hours}时 {minutes}分 {secs}秒"
+    if hours > 0:
+        return f"{hours}时 {minutes}分 {secs}秒"
+    return f"{minutes}分 {secs}秒"
+
+
+def _format_remaining(days, hours, minutes, seconds, mode):
+    if mode in ("dhms", "days"):
+        if days > 0:
+            return f"{days}天 {hours}时 {minutes}分", "", False
+        return f"{hours}时 {minutes}分", "", False
+    if mode == "hms":
+        if days > 0:
+            return f"{days}天 {hours}时 {minutes}分", "", False
+        return f"{hours}时 {minutes:02d}分 {seconds:02d}秒", "", True
+    if mode == "ms":
+        return f"{minutes}分 {seconds:02d}秒", "", True
+    return f"{days}天 {hours}时 {minutes}分", "", False
+
+
+def format_snapshot_display(snapshot, mode, template):
+    mode = str(mode or "auto")
+    if snapshot.expired:
+        if mode == "countup":
+            return f"已过 {format_elapsed_seconds(snapshot.overdue_seconds)}", "", True
+        return "", "", False
+    total = max(0.0, snapshot.total_seconds)
+    if mode == "auto":
+        if total >= 86400:
+            return _format_remaining(snapshot.natural_days, snapshot.hours,
+                                     snapshot.minutes, snapshot.seconds, "dhms")
+        if total >= 3600:
+            return _format_remaining(snapshot.natural_days, snapshot.hours,
+                                     snapshot.minutes, snapshot.seconds, "hms")
+        return _format_remaining(snapshot.natural_days, snapshot.hours,
+                                 snapshot.minutes, snapshot.seconds, "ms")
+    if mode == "decimal":
+        return f"{snapshot.remaining_days:.3f}", " 天", False
+    if mode == "integer":
+        return str(int(snapshot.remaining_days)), " 天", False
+    if mode == "hms":
+        return _format_remaining(snapshot.natural_days, snapshot.hours,
+                                 snapshot.minutes, snapshot.seconds, "hms")
+    if mode == "custom":
+        return render_format_template(template, snapshot.remaining_days), "", "{seconds}" in (template or "")
+    return _format_remaining(snapshot.natural_days, snapshot.hours,
+                             snapshot.minutes, snapshot.seconds, "dhms")
+
+
+def format_snapshot_static(snapshot, project):
+    if getattr(project, "project_type", "normal") == "recurring":
+        if snapshot.target is None:
+            return "🔁 循环已结束"
+        return f"🔁 下次: {describe_next_recurrence(project, snapshot.now)}"
+    if snapshot.target is None:
+        return "已结束"
+    show_both = getattr(project, "show_both", True)
+    if snapshot.expired:
+        parts = []
+        if show_both and snapshot.elapsed_days is not None:
+            parts.append(f"已过 {snapshot.elapsed_days} 天")
+        if show_both:
+            parts.append(f"逾期 {int(snapshot.overdue_seconds // 86400)} 天")
+        return "  ·  ".join(parts) if parts else "已到期"
+    target_time = getattr(project, "target_time", "00:00")
+    if snapshot.natural_days == 0 and target_time != "00:00":
+        base = (f"今日倒计时 · 剩余 {snapshot.hours:02d}时 "
+                f"{snapshot.minutes:02d}分")
+        if show_both and snapshot.elapsed_days is not None:
+            return f"已过 {snapshot.elapsed_days} 天 · {base}"
+        return base
+    if show_both:
+        work_value = (f"{snapshot.work_days_float:.1f}"
+                      if abs(snapshot.work_days_float - int(snapshot.work_days_float)) > 1e-6
+                      else str(snapshot.work_days))
+        work_text = f"剩余工作日: {work_value} 天"
+        if snapshot.elapsed_days is not None:
+            work_text = f"已过 {snapshot.elapsed_days} 天 · {work_text}"
+        holiday_text = f"\n🎉 {snapshot.holiday_name}" if snapshot.holiday_name else ""
+        return work_text + holiday_text
+    return "倒计时"
+
+
+def compute_countdown_snapshot(project, now=None, app=None, schedule=None):
+    now = now or app_now()
+    is_recurring = getattr(project, "project_type", "normal") == "recurring"
+    target = None
+    if is_recurring:
+        target = get_next_recurrence(project, now)
+    else:
+        type_state = getattr(project, "type_state", None)
+        if isinstance(type_state, dict) and type_state.get("target_date"):
+            eff_date = str(type_state.get("target_date") or "")
+            eff_time = str(type_state.get("target_time") or "00:00")
+        else:
+            eff_date, eff_time = get_effective_target(project)
+        if eff_date:
+            try:
+                if eff_time and validate_time(eff_time):
+                    target = datetime.strptime(f"{eff_date} {eff_time}", "%Y-%m-%d %H:%M")
+                else:
+                    target = datetime.strptime(eff_date, "%Y-%m-%d")
+            except ValueError:
+                target = None
+    snapshot = CountdownSnapshot(now=now, target=target)
+    if target is None:
+        snapshot.expired = True
+        snapshot.static_text = format_snapshot_static(snapshot, project)
+        return snapshot
+    total_seconds = (target - now).total_seconds()
+    snapshot.total_seconds = total_seconds
+    snapshot.remaining_days = max(0.0, total_seconds / 86400.0)
+    snapshot.overdue_seconds = max(0.0, -total_seconds)
+    snapshot.expired = total_seconds <= 0
+    positive = max(0.0, total_seconds)
+    snapshot.natural_days = int(positive // 86400)
+    snapshot.hours = int((positive % 86400) // 3600)
+    snapshot.minutes = int((positive % 3600) // 60)
+    snapshot.seconds = int(positive % 60)
+    current_schedule = schedule or resolve_work_schedule(project, app)
+    metrics = _cached_work_metrics(now, target, current_schedule)
+    snapshot.work_seconds = metrics["work_seconds"]
+    snapshot.work_days = metrics["work_days"]
+    snapshot.work_days_float = metrics["work_days_float"]
+    snapshot.daily_hours = metrics["daily_seconds"] / 3600.0
+    snapshot.holiday_name = metrics["holiday_name"]
+    start_day = _parse_date_value(getattr(project, "start_date", ""))
+    if start_day is not None:
+        snapshot.elapsed_days = max(0, (now.date() - start_day).days)
+    mode = getattr(project, "display_format", "auto") or "auto"
+    template = getattr(project, "display_format_template", FORMAT_PRESET_DHM) or FORMAT_PRESET_DHM
+    display_text, display_unit, uses_seconds = format_snapshot_display(snapshot, mode, template)
+    snapshot.display_text = display_text
+    snapshot.display_unit = display_unit
+    snapshot.uses_seconds = uses_seconds
+    snapshot.static_text = format_snapshot_static(snapshot, project)
+    type_state = getattr(project, "type_state", None)
+    if isinstance(type_state, dict):
+        if type_state.get("display_text"):
+            snapshot.display_text = str(type_state.get("display_text"))
+            snapshot.display_unit = str(type_state.get("display_unit") or "")
+            snapshot.uses_seconds = bool(type_state.get("uses_seconds", snapshot.uses_seconds))
+        if type_state.get("static_text"):
+            snapshot.static_text = str(type_state.get("static_text"))
+    return snapshot
+
+
+def calculate_days(target_date, target_time="00:00", now=None):
+    now = now or app_now()
     try:
         if not validate_date(target_date):
             return 0, 0, 0, 0, 0.0, ""
@@ -1541,75 +1974,14 @@ def calculate_days(target_date, target_time="00:00"):
             target = datetime.strptime(f"{target_date} {target_time}", "%Y-%m-%d %H:%M")
         else:
             target = datetime.strptime(target_date, "%Y-%m-%d")
-        if target < today:
+        if target < now:
             return 0, 0, 0, 0, 0.0, ""
-        diff = target - today
-        total_seconds = diff.total_seconds()
-        days = int(total_seconds // (24 * 3600))
-        hours = int((total_seconds % (24 * 3600)) // 3600)
+        total_seconds = (target - now).total_seconds()
+        days = int(total_seconds // 86400)
+        hours = int((total_seconds % 86400) // 3600)
         minutes = int((total_seconds % 3600) // 60)
-        total_days = (target.date() - today.date()).days
-
-        work_days = 0
-        work_seconds = 0.0
-        holiday_name = ""
-
-        _fallback_logged = False
-
-        def _safe_is_workday(d):
-            nonlocal _fallback_logged
-            try:
-                import chinese_calendar
-                return chinese_calendar.is_workday(d)
-            except NotImplementedError:
-                if not _fallback_logged:
-                    log_message(f"年份 {d.year} 超出 chinese_calendar 支持范围，回退到标准工作日", "WARNING")
-                    _fallback_logged = True
-                return d.weekday() < 5
-
-        def _safe_get_holiday_detail(d):
-            nonlocal _fallback_logged
-            try:
-                import chinese_calendar
-                return chinese_calendar.get_holiday_detail(d)
-            except NotImplementedError:
-                if not _fallback_logged:
-                    log_message(f"年份 {d.year} 超出 chinese_calendar 支持范围，回退到标准工作日", "WARNING")
-                    _fallback_logged = True
-                return (d.weekday() >= 5, "")
-
-        if total_days > 0:
-            on_today, today_holiday = _safe_get_holiday_detail(today.date())
-            if on_today and today_holiday:
-                holiday_name = today_holiday
-            for i in range(total_days):
-                current_date = today.date() + timedelta(days=i + 1)
-                if _safe_is_workday(current_date):
-                    work_days += 1
-                elif not holiday_name:
-                    on_holiday, name = _safe_get_holiday_detail(current_date)
-                    if on_holiday and name:
-                        holiday_name = name
-
-        holiday_name = localize_holiday_name(holiday_name)
-
-        if _safe_is_workday(today.date()):
-            now_time = today.hour * 3600 + today.minute * 60 + today.second
-            work_start = 9 * 3600
-            work_end = 18 * 3600
-            if now_time < work_start:
-                remaining_today = work_end - work_start
-            elif now_time > work_end:
-                remaining_today = 0.0
-            else:
-                remaining_today = work_end - now_time
-            work_seconds = work_days * 8 * 3600 + remaining_today
-        else:
-            work_seconds = work_days * 8 * 3600
-
-        work_days_float = work_seconds / (8 * 3600)
-
-        return days, hours, minutes, work_days, work_days_float, holiday_name
+        metrics = _cached_work_metrics(now, target, WORK_SCHEDULE_PRESETS["standard"])
+        return days, hours, minutes, metrics["work_days"], metrics["work_days_float"], metrics["holiday_name"]
     except ValueError:
         return 0, 0, 0, 0, 0.0, ""
 
@@ -1788,11 +2160,11 @@ def get_effective_target(project):
     return nxt.strftime("%Y-%m-%d"), nxt.strftime("%H:%M")
 
 
-def describe_next_recurrence(project):
-    nxt = get_next_recurrence(project)
+def describe_next_recurrence(project, now=None):
+    now = now or app_now()
+    nxt = get_next_recurrence(project, now)
     if nxt is None:
         return "已结束"
-    now = app_now()
     days_until = (nxt.date() - now.date()).days
     time_str = nxt.strftime("%H:%M")
     mode = getattr(project, 'recur_mode', 'weekly') or 'weekly'
@@ -1818,23 +2190,15 @@ def describe_next_recurrence(project):
     return f"{nxt.strftime('%Y-%m-%d')} {time_str}"
 
 
-def compute_static_text(project):
+def compute_static_text(project, snapshot=None, app=None):
     is_recurring = getattr(project, 'project_type', 'normal') == 'recurring'
+    if snapshot is None:
+        snapshot = compute_countdown_snapshot(project, app=app)
     if is_recurring:
-        nxt = describe_next_recurrence(project)
-        return f"🔁 下次: {nxt}" if nxt != "已结束" else "🔁 循环已结束"
-    eff_date, eff_time = get_effective_target(project)
-    if not eff_date:
-        return ""
-    days, hours, minutes, work_days, work_days_float, holiday_name = calculate_days(eff_date, eff_time)
-    if days == 0 and hours == 0 and minutes == 0:
-        return "已到期"
-    if days == 0 and getattr(project, 'target_time', '00:00') != "00:00":
-        return "今日倒计时"
-    if getattr(project, 'show_both', True):
-        holiday_text = f"\n🎉 {holiday_name}" if holiday_name else ""
-        return f"剩余工作日: {work_days} 天{holiday_text}"
-    return "倒计时"
+        if snapshot.target is None:
+            return "🔁 循环已结束"
+        return f"🔁 下次: {describe_next_recurrence(project, snapshot.now)}"
+    return snapshot.static_text or ""
 
 class RollingNumberLabel(QWidget):
     value_changed = pyqtSignal(float)
@@ -1856,6 +2220,8 @@ class RollingNumberLabel(QWidget):
         self._display_format = "decimal"
         self._display_format_template = "{days}天 {hours}时 {minutes}分"
         self._raw_days = 0.0
+        self._uses_seconds = False
+        self._snapshot = None
         self.use_neon = True
         self.enable_flip_animation = True
         self.gradient_start = QColor("#F59E0B")
@@ -1964,31 +2330,89 @@ class RollingNumberLabel(QWidget):
     def set_display_format(self, fmt, template="{days}天 {hours}时 {minutes}分"):
         self._display_format = fmt
         self._display_format_template = template
-        if not self._expired and self._raw_days > 0:
+        if self._snapshot is not None:
+            self.set_state(self._snapshot)
+        elif not self._expired and self._raw_days > 0:
             self._apply_format_and_update()
 
     def _format_value(self, days_float):
+        total_seconds = max(0.0, days_float * 86400)
+        d = int(total_seconds // 86400)
+        h = int((total_seconds % 86400) // 3600)
+        m = int((total_seconds % 3600) // 60)
+        s = int(total_seconds % 60)
         if self._display_format == "decimal":
             return f"{days_float:.3f}", " 天"
         elif self._display_format == "integer":
             return str(int(days_float)), " 天"
-        elif self._display_format == "hms":
-            total_seconds = days_float * 86400
-            d = int(total_seconds // 86400)
-            h = int((total_seconds % 86400) // 3600)
-            m = int((total_seconds % 3600) // 60)
+        elif self._display_format == "auto":
+            if total_seconds >= 86400:
+                return f"{d}天 {h}时 {m}分", ""
+            if total_seconds >= 3600:
+                return f"{h}时 {m:02d}分 {s:02d}秒", ""
+            return f"{m}分 {s:02d}秒", ""
+        elif self._display_format in ("dhms", "days"):
             if d > 0:
                 return f"{d}天 {h}时 {m}分", ""
-            else:
-                return f"{h}时 {m}分", ""
+            return f"{h}时 {m}分", ""
+        elif self._display_format == "hms":
+            if d > 0:
+                return f"{d}天 {h}时 {m}分", ""
+            return f"{h}时 {m:02d}分 {s:02d}秒", ""
         elif self._display_format == "custom":
             return render_format_template(self._display_format_template, days_float), ""
         return f"{days_float:.3f}", " 天"
 
     def uses_seconds(self):
+        if self._snapshot is not None:
+            return bool(self._uses_seconds)
         if self._display_format == "custom":
             return "{seconds}" in (self._display_format_template or "")
+        if self._display_format in ("auto", "hms"):
+            return 0 < self._raw_days * 86400 < 86400
         return False
+
+    def set_state(self, snapshot):
+        self._snapshot = snapshot
+        display_text, display_unit, uses_seconds = format_snapshot_display(
+            snapshot, self._display_format, self._display_format_template)
+        self._uses_seconds = bool(uses_seconds)
+        if getattr(snapshot, "expired", False):
+            if self._display_format == "countup":
+                self._expired = False
+                self.stopBlink()
+                self._target_value = -max(0.0, snapshot.overdue_seconds / 86400.0)
+                self._raw_days = self._target_value
+                self._apply_text(display_text, display_unit, True)
+                self.value_changed.emit(self._target_value)
+                return
+            if not self._expired or self._target_str != (self._expired_text or "0.000"):
+                self.showExpired(self._expired_text)
+            return
+        self._expired = False
+        self.stopBlink()
+        self._target_value = snapshot.remaining_days
+        self._raw_days = snapshot.remaining_days
+        self._apply_text(display_text, display_unit, self._uses_seconds)
+        self.value_changed.emit(self._target_value)
+
+    def _apply_text(self, target_str, unit, uses_seconds):
+        self._unit = unit
+        if target_str == self._target_str:
+            return
+        if self._anim.state() == QPropertyAnimation.State.Running:
+            self._anim.stop()
+            self._current_str = self._target_str
+        self._target_str = target_str
+        if not getattr(self, 'enable_flip_animation', True) or len(self._current_str) != len(self._target_str):
+            self._current_str = self._target_str
+            self._anim_progress = 1.0
+            self.update()
+            return
+        self._anim.setDuration(400 if uses_seconds else 800)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.start()
 
     def _apply_format_and_update(self):
         target_str, unit = self._format_value(self._raw_days)
@@ -4560,6 +4984,8 @@ class PluginPermission(IntFlag):
     UI_MUTATE = auto()
     PLUGIN_CALL = auto()
     PLUGIN_DATA_SHARE = auto()
+    PROJECT_TYPE = auto()
+    ENV_WRITE = auto()
 
 
 _PERM_LABELS = (
@@ -4587,6 +5013,8 @@ _PERM_LABELS = (
     (PluginPermission.UI_MUTATE, "改写控件类"),
     (PluginPermission.PLUGIN_CALL, "调用插件服务"),
     (PluginPermission.PLUGIN_DATA_SHARE, "跨插件数据"),
+    (PluginPermission.PROJECT_TYPE, "项目类型扩展"),
+    (PluginPermission.ENV_WRITE, "修改环境变量"),
 )
 
 _WIRED_PERMISSIONS = frozenset(flag for flag, _label in _PERM_LABELS)
@@ -4661,9 +5089,15 @@ _PERM_SPECS = {
     PluginPermission.PLUGIN_CALL: {
         "name": "调用其他插件提供的服务", "risk": 2, "baseline": False, "fallback": False,
         "scope": "对方清单中声明公开的服务"},
+    PluginPermission.ENV_WRITE: {
+        "name": "修改环境变量", "risk": 3, "baseline": False, "fallback": False,
+        "scope": "当前进程环境变量"},
     PluginPermission.PLUGIN_DATA_SHARE: {
         "name": "读写其他插件导出的数据", "risk": 3, "baseline": False, "fallback": False,
         "scope": "对方清单 exports.data 允许的命名空间"},
+    PluginPermission.PROJECT_TYPE: {
+        "name": "定义项目类型与运行逻辑", "risk": 3, "baseline": False, "fallback": False,
+        "scope": "项目类型字段 schema、解析器与调度器"},
 }
 
 _PERM_BY_NAME = {flag.name: flag for flag, _label in _PERM_LABELS}
@@ -5238,36 +5672,89 @@ class _PluginManagerFacade:
         return "<PluginManagerFacade>"
 
 
+_PLUGIN_API_APPS = weakref.WeakKeyDictionary()
+_PLUGIN_APP_FACADES = weakref.WeakKeyDictionary()
+
+
+class _PluginAppFacade:
+
+    _FIELDS = frozenset({
+        "theme", "current_theme", "data_dir", "config_path", "current_version",
+        "build_version", "global_disable_all_plugins", "security_center_disabled",
+        "plugin_monitor", "plugin_prompt_on_deny", "plugin_prompt_on_intercept",
+        "custom_widget_registry", "dynamic_bg_registry", "dynamic_bg_classes",
+        "fullscreen_skin_registry", "float_widget_registry", "plugin_settings_pages",
+        "plugin_settings_panels", "_security_events", "_sensitive_logs",
+    })
+    _METHODS = frozenset({
+        "save_config", "append_security_event", "append_sensitive_log",
+        "notify_security_denied", "update_plugin_log", "refresh_plugin_float_widgets",
+        "rebuild_tray_menu", "refresh_theme",
+    })
+    def __init__(self, real):
+        _PLUGIN_APP_FACADES[self] = real
+
+    def __getattr__(self, name):
+        real = _PLUGIN_APP_FACADES.get(self)
+        if real is None:
+            raise AttributeError("宿主代理已失效")
+        if name == "plugin_manager":
+            manager = getattr(real, "plugin_manager", None)
+            return _PluginManagerFacade(manager) if manager is not None else None
+        if name == "windows":
+            return []
+        if name == "tray_icon":
+            return None
+        if name in _PluginAppFacade._FIELDS:
+            return getattr(real, name, None)
+        if name in _PluginAppFacade._METHODS:
+            method = getattr(real, name, None)
+            if callable(method):
+                return method
+        raise AttributeError(f"宿主对象不暴露 {name}")
+
+    def __setattr__(self, name, value):
+        raise _manager_hard_denial(name, "插件不可改写宿主应用对象")
+
+    def __delattr__(self, name):
+        raise _manager_hard_denial(name, "插件不可删除宿主应用对象字段")
+
+    def __repr__(self):
+        return "<PluginAppFacade>"
+
+
 class PluginAPI:
 
     def __init__(self, plugin, app):
         self._plugin = plugin
-        self.__api_app = app
+        _PLUGIN_API_APPS[self] = app
         self._denial_callback = None
         self._last_denial = None
         self._degraded = {}
 
     @property
     def _app(self):
-        try:
-            frame = sys._getframe(1)
-            caller = os.path.basename(frame.f_code.co_filename or "")
-        except Exception:
-            caller = ""
-        if caller and not caller.startswith("djs_pyqt6"):
-            self._observe("api.direct_app_access", f"插件直接访问 api._app（{caller}），应改用 api.host")
-        return self.__api_app
+        real = _PLUGIN_API_APPS.get(self)
+        if _caller_is_plugin_frame(2, 1):
+            self._observe("api.direct_app_access",
+                          "插件直接访问 api._app，已返回只读宿主代理，请改用 api.host")
+            return _PluginAppFacade(real) if real is not None else None
+        return real
 
     @_app.setter
     def _app(self, value):
-        self.__api_app = value
+        if _caller_is_plugin_frame(2, 1):
+            raise _manager_hard_denial("_app", "插件不可替换宿主应用引用")
+        _PLUGIN_API_APPS[self] = value
 
     @property
     def host(self):
         return HostFacade(self)
 
     def _internal_manager(self):
-        return getattr(self.__api_app, "plugin_manager", None)
+        if _caller_is_plugin_frame(2, 1):
+            raise _manager_hard_denial("_internal_manager", "插件不可直接获取插件管理器")
+        return getattr(_PLUGIN_API_APPS.get(self), "plugin_manager", None)
 
     def _manager(self):
         manager = self._internal_manager()
@@ -5317,6 +5804,92 @@ class PluginAPI:
             msg = f"{kind}注册失败: ID 重复 (ID={id_name})"
             self._app.plugin_manager.report_register_error(self._plugin_name(), msg)
             raise ValueError(msg)
+
+    def register_renderer(self, renderer_id, name, widget_class, description="",
+                          config_schema=None, tick_interval_ms=1000):
+        self._require(PluginPermission.UI_INJECT, "register_renderer", "无界面注入权限（注册倒计时渲染器）")
+        self._validate_widget_class(renderer_id, widget_class, "倒计时渲染器")
+        registry = self._app.plugin_manager.plugin_renderers
+        self._check_duplicate_id(renderer_id, registry, "倒计时渲染器")
+        registry[renderer_id] = {
+            "name": str(name)[:64],
+            "class": widget_class,
+            "plugin": self._plugin_name(),
+            "description": str(description or "")[:200],
+            "config_schema": config_schema,
+            "tick_interval_ms": int(tick_interval_ms or 1000),
+        }
+
+    def register_ui_slot(self, slot_id, display_name, widget_class,
+                         target="countdown_window", element="countdown",
+                         position="after", size=(320, 120), offset=(0, 0),
+                         replace=False):
+        self._require(PluginPermission.UI_INJECT, "register_ui_slot",
+                      "无界面注入权限（注册语义插槽）")
+        if replace:
+            self._require(PluginPermission.UI_MUTATE, "register_ui_slot",
+                          "无界面改写权限（替换已有元素）")
+        self._validate_widget_class(slot_id, widget_class, "语义插槽")
+        registry = self._app.plugin_manager.plugin_ui_slots
+        self._check_duplicate_id(slot_id, registry, "语义插槽")
+        try:
+            width, height = int(size[0]), int(size[1])
+        except Exception:
+            width, height = 320, 120
+        try:
+            off_x, off_y = int(offset[0]), int(offset[1])
+        except Exception:
+            off_x, off_y = 0, 0
+        position = str(position or "after")
+        if position not in ("before", "after", "over", "replace"):
+            position = "after"
+        target = str(target or "countdown_window")
+        if target not in ("countdown_window", "global_overview", "settings", "project_editor"):
+            target = "countdown_window"
+        element = str(element or "countdown")
+        if element not in ("name", "static_text", "countdown", "weather",
+                           "pomodoro", "poem", "tip", "toolbar"):
+            element = "countdown"
+        registry[slot_id] = {
+            "name": str(display_name)[:64],
+            "class": widget_class,
+            "plugin": self._plugin_name(),
+            "target": target,
+            "element": element,
+            "position": position,
+            "size": [max(40, width), max(24, height)],
+            "offset": [off_x, off_y],
+            "replace": bool(replace),
+        }
+
+    def on_qt(self, event_type, callback, target="all", throttle_ms=200):
+        self._require(PluginPermission.EVENT_LISTEN, "events.on_qt", "无监听事件权限")
+        self._require(PluginPermission.UI_READ, "events.on_qt", "无读取界面结构权限（Qt 事件）")
+        if str(event_type) not in _PLUGIN_QT_EVENT_NAMES or not callable(callback):
+            raise ValueError("无效的 Qt 事件订阅")
+        self._app.plugin_manager.subscribe_qt_listener(
+            str(event_type), callback, str(target or "all"), self._plugin_file())
+
+    def off_qt(self, event_type):
+        self._app.plugin_manager.unsubscribe_qt_listener(str(event_type), self._plugin_file())
+
+    def register_project_type(self, type_id, name, description="", schema=None,
+                              defaults=None, editor=None, renderer=None,
+                              resolver=None, scheduler=None, version=1):
+        self._require(PluginPermission.PROJECT_TYPE, "register_project_type",
+                      "无项目类型扩展权限")
+        self._app.plugin_manager.plugin_project_types[str(type_id)] = {
+            "name": str(name)[:64],
+            "description": str(description or "")[:200],
+            "plugin": self._plugin_name(),
+            "schema": schema if isinstance(schema, list) else [],
+            "defaults": defaults if isinstance(defaults, dict) else {},
+            "editor": editor,
+            "renderer": str(renderer or ""),
+            "resolver": resolver if callable(resolver) else None,
+            "scheduler": scheduler if callable(scheduler) else None,
+            "version": int(version or 1),
+        }
 
     def register_dynamic_bg(self, id_name, display_name, widget_class, border_radius=None):
         self._require(PluginPermission.UI_INJECT, "register_dynamic_bg", "无界面注入权限（注册动态背景）")
@@ -5423,6 +5996,32 @@ class PluginAPI:
 
     def set_config(self, key, value):
         self._app.plugin_manager.set_plugin_config(self._plugin.name, key, value)
+
+    def publish_data(self, namespace, key, value):
+        self._require(PluginPermission.PLUGIN_DATA_SHARE, "data.publish",
+                      "无跨插件数据权限（发布数据）")
+        return self._app.plugin_manager.publish_plugin_data(
+            self._plugin_file(), namespace, key, value)
+
+    def read_data(self, owner, namespace, key=None):
+        self._require(PluginPermission.PLUGIN_DATA_SHARE, "data.read",
+                      "无跨插件数据权限（读取数据）")
+        return self._app.plugin_manager.read_plugin_data(owner, namespace, key)
+
+    def list_data_namespaces(self, owner=None):
+        self._require(PluginPermission.PLUGIN_DATA_SHARE, "data.list",
+                      "无跨插件数据权限（列出命名空间）")
+        return self._app.plugin_manager.list_plugin_data_namespaces(owner)
+
+    def subscribe_data(self, owner, namespace, callback):
+        self._require(PluginPermission.PLUGIN_DATA_SHARE, "data.subscribe",
+                      "无跨插件数据权限（订阅数据）")
+        self._app.plugin_manager.subscribe_plugin_data(
+            owner, namespace, callback, self._plugin_file())
+
+    def unsubscribe_data(self, owner, namespace):
+        self._app.plugin_manager.unsubscribe_plugin_data(
+            owner, namespace, self._plugin_file())
 
     def show_notification(self, title, message):
         self._require(PluginPermission.NOTIFICATION, "show_notification", "无发送通知权限")
@@ -5757,7 +6356,7 @@ class HostFacade:
         raise AttributeError(f"api.host 不暴露 {name}")
 
 
-_PLUGIN_API_VERSION = 3
+_PLUGIN_API_VERSION = 4
 
 
 import threading
@@ -5765,8 +6364,84 @@ import sys
 import os
 import json
 
-_plugin_context = threading.local()
+_PLUGIN_CONTEXT_TOKEN = object()
+_PLUGIN_REFLECT_PATTERNS = (
+    "__subclasses__", "__globals__", "__builtins__", "__code__", "__closure__",
+    "__bases__", "__mro__", "f_globals", "f_builtins", "f_locals", "gi_frame",
+)
+
+
+class _PluginContextStore(threading.local):
+
+    def __init__(self):
+        self.__dict__["_plugin_value"] = None
+        self.__dict__["_plugin_token"] = None
+
+    @property
+    def current_plugin(self):
+        if self.__dict__.get("_plugin_token") is not _PLUGIN_CONTEXT_TOKEN:
+            return None
+        return self.__dict__.get("_plugin_value")
+
+    @current_plugin.setter
+    def current_plugin(self, value):
+        if _caller_is_plugin_frame(2, 1):
+            raise _audit_control_denial("current_plugin")
+        self.__dict__["_plugin_value"] = value
+        self.__dict__["_plugin_token"] = _PLUGIN_CONTEXT_TOKEN
+
+    def __setattr__(self, name, value):
+        if name == "current_plugin":
+            if _caller_is_plugin_frame(2, 1):
+                raise _audit_control_denial(name)
+            self.__dict__["_plugin_value"] = value
+            self.__dict__["_plugin_token"] = _PLUGIN_CONTEXT_TOKEN
+            return
+        if _caller_is_plugin_frame(2, 1):
+            raise _audit_control_denial(name)
+        self.__dict__[name] = value
+
+    def __delattr__(self, name):
+        if _caller_is_plugin_frame(2, 1):
+            raise _audit_control_denial(name)
+        object.__delattr__(self, name)
+
+
+_plugin_context = _PluginContextStore()
 _audit_guard = _GuardedAuditLocal()
+
+_PLUGIN_SDK_EXPORTS = (
+    "Plugin", "PluginPermission", "PluginPermissionDenied", "PermissionResult",
+    "Theme", "get_theme_colors", "flat_palette", "is_system_dark",
+    "make_num_font", "paint_flat_card", "resource_path", "app_icon",
+    "tr", "app_now",
+)
+
+
+def _install_plugin_sdk_proxy(real_module=None):
+    real_module = real_module or sys.modules.get("__main__") or sys.modules.get("djs_pyqt6")
+    if real_module is None:
+        return None
+    proxy = types.ModuleType("djs_pyqt6")
+    exports = {}
+    for name in _PLUGIN_SDK_EXPORTS:
+        try:
+            value = getattr(real_module, name)
+        except Exception:
+            continue
+        exports[name] = value
+        setattr(proxy, name, value)
+    proxy.__dict__["_sdk_exports"] = exports
+    proxy.__dict__["__all__"] = list(exports)
+
+    def _sdk_getattr(name):
+        if name in exports:
+            return exports[name]
+        raise AttributeError(f"插件 SDK 不暴露 {name}")
+
+    proxy.__dict__["__getattr__"] = _sdk_getattr
+    sys.modules["djs_pyqt6"] = proxy
+    return proxy
 
 class PluginRowDelegate(QStyledItemDelegate):
     def __init__(self, parent=None):
@@ -5845,6 +6520,21 @@ def apply_plugin_manifest(plugin, manifest):
     if isinstance(om, list):
         plugin.own_modules = [str(x).strip()[:200] for x in om
                               if isinstance(x, str) and x.strip()]
+    exports = manifest.get("exports")
+    data_exports = exports.get("data") if isinstance(exports, dict) else None
+    if isinstance(data_exports, list):
+        for item in data_exports:
+            if not isinstance(item, dict):
+                continue
+            namespace = str(item.get("namespace") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", namespace):
+                continue
+            plugin.data_exports[namespace] = {
+                "namespace": namespace,
+                "version": int(item.get("version") or 1),
+                "schema": item.get("schema") if isinstance(item.get("schema"), dict) else {},
+                "access": str(item.get("access") or "read"),
+            }
 
 
 def write_autostart_registry(name, path, enable=True):
@@ -5897,9 +6587,23 @@ def write_autostart_registry(name, path, enable=True):
 
 class PluginManager(QObject):
 
+    _SENSITIVE_ATTRS = frozenset({
+        "plugin_security", "_auth_perms", "_grant_entry", "set_grants_bulk",
+        "save_security_config", "public_key", "_load_public_key", "generate_key_pair",
+        "_sync_auth_cache", "effective_permissions", "authority", "authority_bits",
+        "app", "guard", "plugin_manager",
+    })
+
+    def __getattribute__(self, name):
+        if name in PluginManager._SENSITIVE_ATTRS and _caller_is_plugin_frame(2, 1):
+            raise _manager_hard_denial(name, "插件不可访问插件管理器安全内部")
+        return object.__getattribute__(self, name)
+
     def __setattr__(self, name, value):
         if name in ("_audit_suppress", "_PluginManager__audit_suppress") and _caller_is_plugin_frame(2, 1):
             raise _audit_control_denial(name)
+        if name in PluginManager._SENSITIVE_ATTRS and _caller_is_plugin_frame(2, 1):
+            raise _manager_hard_denial(name, "插件不可改写插件管理器安全内部")
         object.__setattr__(self, name, value)
 
     _FILE_EVENTS = frozenset({
@@ -5915,13 +6619,17 @@ class PluginManager(QObject):
     _TRUST_ENFORCED_PERMS = (PluginPermission.COMMAND | PluginPermission.COMMAND_EXEC
                              | PluginPermission.PROCESS_SPAWN | PluginPermission.DANGEROUS_EVAL
                              | PluginPermission.REGISTRY | PluginPermission.PLUGIN_CALL
-                             | PluginPermission.PLUGIN_DATA_SHARE)
+                             | PluginPermission.PLUGIN_DATA_SHARE
+                             | PluginPermission.PROJECT_TYPE
+                             | PluginPermission.ENV_WRITE)
     _BLOCKED_MODULES = frozenset({
         "ctypes", "_ctypes", "cffi", "_cffi_backend", "builtins", "__builtin__",
         "gc", "inspect", "importlib", "imp", "marshal", "pickle", "_pickle",
         "subprocess", "winreg", "_winreg", "shutil", "multiprocessing", "mmap",
         "pty", "pdb", "bdb", "code", "codeop", "runpy", "faulthandler",
         "sysconfig", "sitecustomize", "usercustomize", "_thread",
+        "sys", "_winapi", "nt", "posix", "msvcrt", "pkgutil", "zipimport",
+        "_frozen_importlib", "_frozen_importlib_external",
     })
     AUDIT_POLICY = {
         "os.remove": PluginPermission.FILE_DELETE,
@@ -5942,8 +6650,8 @@ class PluginManager(QObject):
         "os.fork": PluginPermission.PROCESS_SPAWN,
         "os.forkpty": PluginPermission.PROCESS_SPAWN,
         "os.kill": PluginPermission.PROCESS_SPAWN,
-        "os.putenv": PluginPermission.ENV_READ,
-        "os.unsetenv": PluginPermission.ENV_READ,
+        "os.putenv": PluginPermission.ENV_WRITE,
+        "os.unsetenv": PluginPermission.ENV_WRITE,
         "os.startfile": PluginPermission.COMMAND,
         "os.setxattr": PluginPermission.FILE_WRITE,
         "subprocess.Popen": PluginPermission.COMMAND,
@@ -6066,30 +6774,30 @@ class PluginManager(QObject):
         "os.remove", "os.unlink", "os.rmdir",
     })
     _CODE_RISK_MODULES = {
-        "ctypes": 5, "_ctypes": 5, "cffi": 5, "win32api": 5, "pythoncom": 5,
-        "subprocess": 5, "winreg": 4, "_winreg": 4, "win32con": 4,
-        "multiprocessing": 4, "marshal": 4, "pickle": 4, "importlib": 4,
-        "socket": 2, "socketserver": 3, "ftplib": 3, "smtplib": 3, "telnetlib": 3,
-        "paramiko": 3, "gc": 3, "inspect": 3, "builtins": 3, "mmap": 3,
-        "runpy": 3, "code": 3, "codeop": 3, "imp": 3,
-        "shutil": 2, "urllib": 2, "urllib3": 2, "requests": 2, "http": 2, "httpx": 2,
-        "sqlite3": 2, "pdb": 2,
-        "pathlib": 1, "glob": 1, "tempfile": 1, "threading": 1, "asyncio": 1,
-        "base64": 1, "binascii": 1, "struct": 1,
+        "ctypes": 4, "_ctypes": 4, "cffi": 4, "win32api": 4, "pythoncom": 4,
+        "subprocess": 4, "winreg": 3, "_winreg": 3, "win32con": 3,
+        "multiprocessing": 3, "marshal": 3, "pickle": 3, "importlib": 3,
+        "socket": 1, "socketserver": 2, "ftplib": 2, "smtplib": 2, "telnetlib": 2,
+        "paramiko": 2, "gc": 2, "inspect": 2, "builtins": 2, "mmap": 2,
+        "runpy": 2, "code": 2, "codeop": 2, "imp": 2,
+        "shutil": 1, "urllib": 1, "urllib3": 1, "requests": 1, "http": 1, "httpx": 1,
+        "sqlite3": 1, "pdb": 1,
+        "pathlib": 0, "glob": 0, "tempfile": 0, "threading": 0, "asyncio": 0,
+        "base64": 0, "binascii": 0, "struct": 0,
     }
     _CODE_RISK_CALLS = {
-        "eval": 6, "exec": 6, "compile": 6, "__import__": 5,
-        "breakpoint": 3, "globals": 2, "locals": 2, "vars": 1, "input": 1, "open": 1,
+        "eval": 4, "exec": 4, "compile": 4, "__import__": 2,
+        "breakpoint": 2, "globals": 1, "locals": 1, "vars": 0, "input": 0,
     }
     _CODE_RISK_ATTRS = {
         "__subclasses__": 4, "__globals__": 4, "__builtins__": 4, "__code__": 3,
         "__bases__": 3, "__mro__": 2, "__class__": 1, "__dict__": 1,
     }
     _CODE_RISK_CALL_ATTRS = {
-        "system": 5, "popen": 5, "Popen": 5, "spawn": 5, "spawnl": 5,
-        "execv": 5, "execve": 5,
-        "run": 4, "call": 4, "check_output": 4, "SetValue": 4, "SetValueEx": 4,
-        "CreateKey": 4, "DeleteKey": 4, "connect": 2, "decode": 1,
+        "system": 4, "popen": 4, "Popen": 4, "spawn": 4, "spawnl": 4,
+        "execv": 4, "execve": 4,
+        "run": 3, "call": 3, "check_output": 3, "SetValue": 3, "SetValueEx": 3,
+        "CreateKey": 3, "DeleteKey": 3, "connect": 1, "decode": 0,
     }
     _CODE_EXEC_TRIGGERS = frozenset({"eval", "exec", "compile", "__import__", "__builtins__",
                                      "__globals__", "__subclasses__"})
@@ -6112,6 +6820,12 @@ class PluginManager(QObject):
         self._grants_lock = threading.RLock()
         self._session_token = f"{os.getpid()}-{time.time_ns()}"
         self.plugin_configs = {}
+        self.plugin_share_dir = os.path.join(self.app.data_dir, "plugin_share")
+        os.makedirs(self.plugin_share_dir, exist_ok=True)
+        self.qt_event_types = set()
+        self.qt_listeners = {}
+        self._qt_event_last = {}
+        self.data_listeners = {}
         self.signature_required = False
         self.public_key = None
         self._audit_hook_installed = False
@@ -6143,6 +6857,7 @@ class PluginManager(QObject):
         self._host_output_tail = ""
         self._host_loading = False
         self._host_pending_registrations = []
+        self._host_caller_tokens = {}
         self._host_job = None
         self._host_event_window = 0.0
         self._host_event_count = 0
@@ -6157,6 +6872,8 @@ class PluginManager(QObject):
         self._observe_seen = {}
         self.plugin_actions = {}
         self.plugin_project_types = {}
+        self.plugin_renderers = {}
+        self.plugin_ui_slots = {}
         self.plugin_content_kinds = set()
         self.plugin_weather_providers = {}
         self.plugin_settings_pages = {}
@@ -6164,10 +6881,129 @@ class PluginManager(QObject):
         self._host_registered = {"dynamic_bg": set(), "fullscreen_skin": set(),
                                  "settings_panel": set(), "float_widget": set(),
                                  "custom_widget": set(), "settings_page": set(),
-                                 "card_slot": set()}
+                                 "card_slot": set(), "renderer": set(), "ui_slot": set()}
+        _qt_app = QApplication.instance()
+        if _qt_app is not None:
+            _qt_app.installEventFilter(self)
         self.load_security_config()
         if load_immediately:
             self.load_plugins()
+
+    _QT_EVENT_MAP = {
+        QEvent.Type.MouseButtonPress: "mouse_press",
+        QEvent.Type.MouseButtonRelease: "mouse_release",
+        QEvent.Type.MouseButtonDblClick: "mouse_double_click",
+        QEvent.Type.KeyPress: "key_press",
+        QEvent.Type.KeyRelease: "key_release",
+        QEvent.Type.Wheel: "wheel",
+        QEvent.Type.FocusIn: "focus_in",
+        QEvent.Type.FocusOut: "focus_out",
+        QEvent.Type.Show: "window_show",
+        QEvent.Type.Hide: "window_hide",
+        QEvent.Type.Move: "window_move",
+        QEvent.Type.Resize: "window_resize",
+    }
+
+    def _plugin_role_for_widget(self, obj):
+        if obj is None:
+            return ""
+        if hasattr(obj, "countdown_label") and hasattr(obj, "project"):
+            return "countdown"
+        if hasattr(obj, "overview_window") or hasattr(obj, "overviewTitle"):
+            return "overview"
+        try:
+            title = str(obj.windowTitle() or "")
+        except Exception:
+            title = ""
+        if title == "全局视图":
+            return "overview"
+        if title in (tr("settings_title"), tr("edit_project")):
+            return "settings"
+        if hasattr(obj, "_host_token"):
+            return "plugin"
+        return ""
+
+    def _qt_payload(self, event_name, obj, event):
+        payload = {"event": event_name, "role": self._plugin_role_for_widget(obj)}
+        if payload["role"] == "countdown":
+            payload["project"] = str(getattr(getattr(obj, "project", None), "name", ""))
+        try:
+            payload["width"] = int(obj.width())
+            payload["height"] = int(obj.height())
+        except Exception:
+            pass
+        try:
+            if event_name.startswith("mouse") or event_name == "wheel":
+                pos = event.position().toPoint()
+                payload["x"] = int(pos.x())
+                payload["y"] = int(pos.y())
+                payload["button"] = int(event.button().value) if hasattr(event, "button") else 0
+                payload["modifiers"] = int(event.modifiers().value) if hasattr(event, "modifiers") else 0
+                if event_name == "wheel":
+                    payload["delta"] = int(event.angleDelta().y())
+            elif event_name.startswith("key"):
+                payload["key"] = int(event.key())
+                payload["modifiers"] = int(event.modifiers().value)
+            elif event_name in ("window_move", "window_resize"):
+                payload["x"] = int(obj.x())
+                payload["y"] = int(obj.y())
+        except Exception:
+            pass
+        return payload
+
+    def eventFilter(self, obj, event):
+        if not self.qt_event_types:
+            return False
+        event_name = self._QT_EVENT_MAP.get(event.type())
+        if event_name is None or event_name not in self.qt_event_types:
+            return False
+        role = self._plugin_role_for_widget(obj)
+        if role not in ("countdown", "overview", "settings", "plugin"):
+            return False
+        now = time.monotonic()
+        key = (event_name, role)
+        if now - self._qt_event_last.get(key, 0.0) < 0.05:
+            return False
+        self._qt_event_last[key] = now
+        payload = self._qt_payload(event_name, obj, event)
+        for item in list(self.qt_listeners.get(event_name, [])):
+            target = item.get("target") or "all"
+            if target not in ("all", role):
+                continue
+            try:
+                item["callback"](payload)
+            except Exception:
+                continue
+        if self._host_connected():
+            self._send_host({"method": "qt_event", "params": payload})
+        return False
+
+    def subscribe_qt_listener(self, event_type, callback, target="all", filename=""):
+        self.qt_event_types.add(str(event_type))
+        if callable(callback):
+            self.qt_listeners.setdefault(str(event_type), []).append({
+                "callback": callback,
+                "target": str(target or "all"),
+                "plugin": str(filename or ""),
+            })
+
+    def unsubscribe_qt_listener(self, event_type, filename=""):
+        event_type = str(event_type)
+        items = [item for item in self.qt_listeners.get(event_type, [])
+                 if str(item.get("plugin") or "") != str(filename or "")]
+        if items:
+            self.qt_listeners[event_type] = items
+        else:
+            self.qt_listeners.pop(event_type, None)
+
+    def set_host_qt_event(self, event_type, filename, enabled=True):
+        event_type = str(event_type)
+        if enabled:
+            self.qt_event_types.add(event_type)
+        else:
+            has_local = bool(self.qt_listeners.get(event_type))
+            if not has_local:
+                self.qt_event_types.discard(event_type)
 
     def report_register_error(self, plugin_name, message):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] [{plugin_name}] {message}"
@@ -6228,6 +7064,161 @@ class PluginManager(QObject):
             self.plugin_configs[plugin_name] = {}
         self.plugin_configs[plugin_name][key] = value
         self.save_security_config()
+
+    def _share_owner_filename(self, owner):
+        text = str(owner or "").strip()
+        if not text:
+            return ""
+        for plugin in self.plugins:
+            if text in (getattr(plugin, "filename", ""), getattr(plugin, "name", "")):
+                return str(getattr(plugin, "filename", "") or text)
+        return text if re.fullmatch(r"[A-Za-z0-9_.\-]{1,128}", text) else ""
+
+    def _share_manifest_exports(self, filename):
+        result = {}
+        if not filename:
+            return result
+        manifest_path = os.path.join(self.plugin_dir, f"{os.path.splitext(filename)[0]}.json")
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            exports = manifest.get("exports") if isinstance(manifest, dict) else None
+            data_exports = exports.get("data") if isinstance(exports, dict) else None
+            if isinstance(data_exports, list):
+                for item in data_exports:
+                    if not isinstance(item, dict):
+                        continue
+                    namespace = str(item.get("namespace") or "")
+                    if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", namespace):
+                        continue
+                    result[namespace] = {
+                        "namespace": namespace,
+                        "version": int(item.get("version") or 1),
+                        "schema": item.get("schema") if isinstance(item.get("schema"), dict) else {},
+                        "access": str(item.get("access") or "read"),
+                    }
+        except Exception:
+            return result
+        return result
+
+    def _share_export_spec(self, owner, namespace):
+        filename = self._share_owner_filename(owner)
+        if not filename or not re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", str(namespace or "")):
+            return None
+        plugin = next((p for p in self.plugins
+                       if getattr(p, "filename", "") == filename), None)
+        if plugin is not None:
+            spec = (getattr(plugin, "data_exports", {}) or {}).get(str(namespace))
+            if isinstance(spec, dict):
+                return spec
+        return self._share_manifest_exports(filename).get(str(namespace))
+
+    def _share_path(self, owner, namespace):
+        filename = self._share_owner_filename(owner)
+        if not filename or not re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", str(namespace or "")):
+            return ""
+        owner_key = os.path.splitext(os.path.basename(filename))[0]
+        if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", owner_key):
+            return ""
+        folder = os.path.join(self.plugin_share_dir, owner_key)
+        return os.path.join(folder, f"{namespace}.json")
+
+    def publish_plugin_data(self, owner, namespace, key, value):
+        spec = self._share_export_spec(owner, namespace)
+        if spec is None:
+            raise PluginPermissionDenied("命名空间未导出", code="perm.data_share",
+                                         capability="data.publish", origin="api")
+        if spec.get("access") not in ("readwrite", "write"):
+            raise PluginPermissionDenied("命名空间为只读", code="perm.data_share",
+                                         capability="data.publish", origin="api")
+        path = self._share_path(owner, namespace)
+        if not path:
+            raise ValueError("非法命名空间")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = {}
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, dict):
+                    data = loaded
+        except Exception:
+            data = {}
+        data[str(key)] = _host_jsonable(value)
+        encoded = json.dumps(data, ensure_ascii=False)
+        if len(encoded.encode("utf-8")) > 1024 * 1024:
+            raise ValueError("命名空间数据超过 1MB")
+        temp_path = path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            handle.write(encoded)
+        os.replace(temp_path, path)
+        owner_name = self._share_owner_filename(owner)
+        key = (owner_name, str(namespace))
+        for item in list(self.data_listeners.get(key, [])):
+            try:
+                item["callback"](dict(data))
+            except Exception:
+                continue
+        if self._host_connected():
+            self._send_host({"method": "data_changed", "params": {
+                "owner": owner_name, "namespace": str(namespace), "data": data,
+            }})
+        return True
+
+    def subscribe_plugin_data(self, owner, namespace, callback, filename=""):
+        owner_name = self._share_owner_filename(owner)
+        if not owner_name or not callable(callback):
+            raise ValueError("无效的数据订阅")
+        self.data_listeners.setdefault((owner_name, str(namespace)), []).append({
+            "callback": callback,
+            "plugin": str(filename or ""),
+        })
+
+    def unsubscribe_plugin_data(self, owner, namespace, filename=""):
+        owner_name = self._share_owner_filename(owner)
+        key = (owner_name, str(namespace))
+        items = [item for item in self.data_listeners.get(key, [])
+                 if str(item.get("plugin") or "") != str(filename or "")]
+        if items:
+            self.data_listeners[key] = items
+        else:
+            self.data_listeners.pop(key, None)
+
+    def read_plugin_data(self, owner, namespace, key=None):
+        spec = self._share_export_spec(owner, namespace)
+        if spec is None:
+            raise PluginPermissionDenied("命名空间未导出", code="perm.data_share",
+                                         capability="data.read", origin="api")
+        path = self._share_path(owner, namespace)
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        if key is None:
+            return dict(data)
+        return data.get(str(key))
+
+    def list_plugin_data_namespaces(self, owner=None):
+        if owner:
+            filename = self._share_owner_filename(owner)
+            plugin = next((p for p in self.plugins
+                           if getattr(p, "filename", "") == filename), None)
+            exports = dict(getattr(plugin, "data_exports", {}) or {})
+            exports.update(self._share_manifest_exports(filename))
+            return [{"owner": filename, "namespace": key, **dict(value)}
+                    for key, value in exports.items()]
+        result = []
+        for plugin in self.plugins:
+            exports = dict(getattr(plugin, "data_exports", {}) or {})
+            exports.update(self._share_manifest_exports(plugin.filename))
+            for key, value in exports.items():
+                result.append({"owner": plugin.filename, "namespace": key, **dict(value)})
+        return result
 
     def _host_next_seq(self):
         self._host_seq += 1
@@ -6559,7 +7550,16 @@ class PluginManager(QObject):
                 if self._host_event_count == _PLUGIN_HOST_EVENT_RATE + 1:
                     log_message("[插件宿主] 事件频率超限，已丢弃后续事件", "WARNING")
                 return
-        self._handle_host_event(name, params)
+        try:
+            self._handle_host_event(name, params)
+        except PluginPermissionDenied as exc:
+            try:
+                self.app.append_security_event(str(params.get("plugin") or "未知插件"),
+                                               "block", name, "", str(exc))
+            except Exception:
+                pass
+        except Exception as exc:
+            log_message(f"[插件宿主] 处理事件 {name} 失败: {exc}", "ERROR")
 
     def _push_host_options(self):
         self._send_host({"id": f"opts-{int(time.time() * 1000)}", "method": "set_options",
@@ -6592,7 +7592,17 @@ class PluginManager(QObject):
         self._send_host({"id": rid, "result": result})
 
     def _handle_host_request(self, kind, rid, params):
-        filename = str(params.get("plugin") or "")
+        token = str(params.get("_caller_token") or "")
+        filename = self._host_caller_tokens.get(token, "") if token else ""
+        if not filename:
+            try:
+                self.app.append_security_event("未知插件", "block", "host_request_token",
+                                               str(kind), "宿主请求缺少有效调用令牌")
+            except Exception:
+                pass
+            self._send_host({"id": rid, "result": None, "error": "forbidden"})
+            return
+        params["plugin"] = filename
         plugin = None
         if self._host_plugin_ok(filename):
             for item in self.plugins:
@@ -6621,6 +7631,9 @@ class PluginManager(QObject):
             "spawn_process": PluginPermission.PROCESS_SPAWN,
             "socket_probe": PluginPermission.NETWORK_SOCKET,
             "ping": PluginPermission.SYSTEM_INFO,
+            "data_get": PluginPermission.PLUGIN_DATA_SHARE,
+            "data_set": PluginPermission.PLUGIN_DATA_SHARE,
+            "data_list": PluginPermission.PLUGIN_DATA_SHARE,
         }.get(op)
         if permission is not None:
             try:
@@ -6630,6 +7643,22 @@ class PluginManager(QObject):
                 self._send_host({"id": rid,
                                  "result": {"ok": False, "error": str(exc)[:200]}})
                 return
+        if op in ("data_get", "data_set", "data_list"):
+            try:
+                if op == "data_set":
+                    result = {"ok": self.publish_plugin_data(
+                        plugin.filename, params.get("namespace"), params.get("key"),
+                        params.get("value"))}
+                elif op == "data_get":
+                    result = {"ok": True, "value": self.read_plugin_data(
+                        params.get("owner"), params.get("namespace"), params.get("key"))}
+                else:
+                    result = {"ok": True, "items": self.list_plugin_data_namespaces(
+                        params.get("owner"))}
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc)[:200]}
+            self._send_host({"id": rid, "result": _host_jsonable(result)})
+            return
         self._send_host({"id": rid, "result": _host_jsonable(_run_host_capability(self.app, op, params))})
 
     def _host_query_payload(self, what):
@@ -6667,6 +7696,42 @@ class PluginManager(QObject):
             return result
         return None
 
+    def _resolve_host_event_plugin(self, params, required=False):
+        token = str(params.get("_caller_token") or "")
+        filename = self._host_caller_tokens.get(token, "") if token else ""
+        if not filename:
+            if required:
+                return ""
+            filename = str(params.get("plugin") or "")
+            if not self._host_plugin_ok(filename):
+                return ""
+        params["plugin"] = filename
+        return filename
+
+    def _host_event_perm(self, plugin_file, permission, event, reason):
+        plugin = next((p for p in self.plugins if p.filename == plugin_file), None)
+        if plugin is None:
+            return bool(getattr(self, "_host_loading", False))
+        if self.app.global_disable_all_plugins or not getattr(plugin, "enabled", False):
+            return False
+        try:
+            return self.require_permission(permission, event, reason, plugin)
+        except PluginPermissionDenied:
+            return False
+
+    def _host_event_denied(self, params, event, reason):
+        if getattr(self.app, "global_disable_all_plugins", False):
+            return
+        filename = str(params.get("plugin") or "未知插件")
+        try:
+            self.app.append_security_event(filename, "block", str(event), "", str(reason))
+        except Exception:
+            pass
+        try:
+            self.report_register_error(filename, str(reason))
+        except Exception:
+            pass
+
     def _handle_host_event(self, name, params):
         if name == "ready":
             self._host_ready = True
@@ -6675,19 +7740,53 @@ class PluginManager(QObject):
             if loop is not None:
                 loop.quit()
             return
+        if name == "caller_token":
+            token = str(params.get("token") or "")
+            plugin_file = str(params.get("plugin") or "")
+            if token and self._host_plugin_ok(plugin_file):
+                self._host_caller_tokens[token] = plugin_file
+            return
         if name == "register":
+            if not self._resolve_host_event_plugin(params, True):
+                self._host_event_denied(params, "host.register", "注册事件缺少有效调用令牌")
+                return
             self._register_remote_widget(params)
             return
+        if name in ("qt_subscribe", "qt_unsubscribe"):
+            if not self._resolve_host_event_plugin(params, True):
+                self._host_event_denied(params, name, "Qt 事件订阅缺少有效调用令牌")
+                return
+            filename = str(params.get("plugin") or "")
+            if name == "qt_subscribe" and not self._host_event_perm(
+                    filename, PluginPermission.EVENT_LISTEN, "host.qt_subscribe",
+                    "缺少事件监听权限（Qt 事件订阅）"):
+                self._host_event_denied(params, name, "缺少 Qt 事件监听权限")
+                return
+            self.set_host_qt_event(str(params.get("event") or ""), filename,
+                                   name == "qt_subscribe")
+            return
         if name == "action_register":
+            if not self._resolve_host_event_plugin(params, True):
+                self._host_event_denied(params, name, "动作注册缺少有效调用令牌")
+                return
             self._register_remote_action(params)
             return
         if name == "project_type_register":
+            if not self._resolve_host_event_plugin(params, True):
+                self._host_event_denied(params, name, "项目类型注册缺少有效调用令牌")
+                return
             self._register_remote_project_type(params)
             return
         if name == "content_provider_register":
+            if not self._resolve_host_event_plugin(params, True):
+                self._host_event_denied(params, name, "内容源注册缺少有效调用令牌")
+                return
             self._register_content_provider(params)
             return
         if name == "weather_provider_register":
+            if not self._resolve_host_event_plugin(params, True):
+                self._host_event_denied(params, name, "天气源注册缺少有效调用令牌")
+                return
             self._register_weather_provider(params)
             return
         if name == "register_error":
@@ -6850,8 +7949,14 @@ class PluginManager(QObject):
         if plugin is None:
             if getattr(self, "_host_loading", False):
                 self._host_pending_registrations.append(params)
-            else:
+            elif not getattr(self.app, "global_disable_all_plugins", False):
                 self.report_register_error(plugin_file, f"注册失败: 插件未加载 (ID={id_name})")
+            return
+        if self.app.global_disable_all_plugins or not getattr(plugin, "enabled", False):
+            return
+        if not self.require_permission(PluginPermission.UI_INJECT, f"host.register.{kind}",
+                                       "缺少界面注入权限（宿主注册）", plugin):
+            self.report_register_error(plugin.name, f"注册失败: 缺少界面注入权限 (ID={id_name})")
             return
         display_name = str(params.get("name") or id_name)
         if kind == "float_widget":
@@ -6972,6 +8077,27 @@ class PluginManager(QObject):
                     self.app._refresh_plugin_card_slots()
                 except Exception:
                     pass
+        elif kind == "ui_slot":
+            if id_name in self.plugin_ui_slots and id_name not in self._host_registered["ui_slot"]:
+                self.report_register_error(plugin.name, f"语义插槽注册失败: ID 重复 (ID={id_name})")
+                return
+            self.plugin_ui_slots[id_name] = {
+                "name": display_name,
+                "class": factory,
+                "plugin": plugin.name,
+                "target": str(params.get("target") or "countdown_window"),
+                "element": str(params.get("element") or "countdown"),
+                "position": str(params.get("position") or "after"),
+                "size": list(factory.default_size),
+                "offset": list(params.get("offset") or [0, 0]),
+                "replace": bool(params.get("replace")),
+            }
+            self._host_registered["ui_slot"].add(id_name)
+            if hasattr(self.app, "_refresh_plugin_ui_slots"):
+                try:
+                    self.app._refresh_plugin_ui_slots()
+                except Exception:
+                    pass
         elif kind == "custom_widget":
             registry = getattr(self.app, "custom_widget_registry", None)
             if registry is None:
@@ -6985,6 +8111,19 @@ class PluginManager(QObject):
                 "class": factory,
             }
             self._host_registered["custom_widget"].add(id_name)
+        elif kind == "renderer":
+            if id_name in self.plugin_renderers and id_name not in self._host_registered["renderer"]:
+                self.report_register_error(plugin.name, f"倒计时渲染器注册失败: ID 重复 (ID={id_name})")
+                return
+            self.plugin_renderers[id_name] = {
+                "name": display_name,
+                "class": factory,
+                "plugin": plugin.name,
+                "description": str(params.get("description") or ""),
+                "config_schema": params.get("config_schema"),
+                "tick_interval_ms": int(params.get("tick_interval_ms") or 1000),
+            }
+            self._host_registered["renderer"].add(id_name)
         else:
             self.report_register_error(plugin.name, f"未知注册类型: {kind}")
             return
@@ -7004,6 +8143,10 @@ class PluginManager(QObject):
             self.app.custom_widget_registry.pop(id_name, None)
         for id_name in list(self._host_registered["card_slot"]):
             self.app.plugin_card_slots.pop(id_name, None)
+        for id_name in list(self._host_registered["renderer"]):
+            self.plugin_renderers.pop(id_name, None)
+        for id_name in list(self._host_registered["ui_slot"]):
+            self.plugin_ui_slots.pop(id_name, None)
         if hasattr(self.app, "_remove_plugin_card_slots"):
             try:
                 self.app._remove_plugin_card_slots()
@@ -7013,10 +8156,14 @@ class PluginManager(QObject):
             self._host_registered[key].clear()
         self.plugin_actions = {}
         self.plugin_project_types = {}
+        self.plugin_renderers = {}
+        self.plugin_ui_slots = {}
         self.plugin_content_kinds = set()
         self.plugin_weather_providers = {}
         self.plugin_settings_pages = {}
         self.plugin_card_slots = {}
+        self.qt_event_types.clear()
+        self.qt_listeners.clear()
         if hasattr(self.app, "_remove_plugin_settings_pages"):
             try:
                 self.app._remove_plugin_settings_pages()
@@ -7046,6 +8193,69 @@ class PluginManager(QObject):
         enabled = self._enabled_filenames()
         return {type_id: info for type_id, info in (self.plugin_project_types or {}).items()
                 if not info.get("plugin") or info.get("plugin") in enabled}
+
+    def resolve_project_type(self, project):
+        type_id = str(getattr(project, "project_type", "normal") or "normal")
+        if type_id in ("normal", "recurring"):
+            return None
+        info = (self.plugin_project_types or {}).get(type_id)
+        if not isinstance(info, dict):
+            return None
+        payload = project.to_dict()
+        payload["type_values"] = (getattr(project, "plugin_data", {}) or {}).get(type_id, {})
+        resolver = info.get("resolver")
+        if callable(resolver):
+            try:
+                result = resolver(payload, app_now().isoformat())
+            except Exception as e:
+                log_message(f"[插件] 项目类型 {type_id} 解析失败: {e}", "ERROR")
+                return None
+            return result if isinstance(result, dict) else None
+        if not info.get("plugin") or not self._host_connected():
+            return None
+        response = self._request_host({
+            "method": "project_type_resolve",
+            "params": {"id": type_id, "project": payload,
+                       "plugin": info.get("plugin", ""),
+                       "now": app_now().isoformat()},
+        }, timeout_ms=2000)
+        if isinstance(response, dict):
+            result = response.get("result")
+            if isinstance(result, dict):
+                return result
+        return None
+
+    def schedule_project_type(self, project):
+        type_id = str(getattr(project, "project_type", "normal") or "normal")
+        if type_id in ("normal", "recurring"):
+            return None
+        info = (self.plugin_project_types or {}).get(type_id)
+        if not isinstance(info, dict):
+            return None
+        payload = project.to_dict()
+        payload["type_values"] = (getattr(project, "plugin_data", {}) or {}).get(type_id, {})
+        payload["type_state"] = dict(getattr(project, "type_state", {}) or {})
+        scheduler = info.get("scheduler")
+        if callable(scheduler):
+            try:
+                result = scheduler(payload, app_now().isoformat())
+            except Exception as e:
+                log_message(f"[插件] 项目类型 {type_id} 调度失败: {e}", "ERROR")
+                return None
+            return result if isinstance(result, dict) else None
+        if not info.get("plugin") or not self._host_connected():
+            return None
+        response = self._request_host({
+            "method": "project_type_schedule",
+            "params": {"id": type_id, "project": payload,
+                       "plugin": info.get("plugin", ""),
+                       "now": app_now().isoformat()},
+        }, timeout_ms=2000)
+        if isinstance(response, dict):
+            result = response.get("result")
+            if isinstance(result, dict):
+                return result
+        return None
 
     def weather_provider_items(self):
         enabled = self._enabled_filenames()
@@ -7183,6 +8393,9 @@ class PluginManager(QObject):
             return
         if not self._host_plugin_ok(plugin_file):
             return
+        if not self._host_event_perm(plugin_file, PluginPermission.PLUGIN_DATA_SHARE,
+                                     "host.weather_provider", "缺少跨插件数据权限（天气源）"):
+            return
         self.plugin_weather_providers[provider_id] = {"name": name, "plugin": plugin_file}
         if hasattr(self.app, "combo_weather_source"):
             try:
@@ -7220,6 +8433,9 @@ class PluginManager(QObject):
         plugin_file = str(params.get("plugin") or "")
         if not self._host_plugin_ok(plugin_file):
             return
+        if not self._host_event_perm(plugin_file, PluginPermission.PLUGIN_DATA_SHARE,
+                                     "host.content_provider", "缺少跨插件数据权限（内容源）"):
+            return
         self.plugin_content_kinds.add(kind)
 
     def request_content(self, kind, payload=None, timeout_ms=200):
@@ -7248,6 +8464,9 @@ class PluginManager(QObject):
         plugin = next((p for p in self.plugins if p.filename == plugin_file), None)
         if plugin is None and not getattr(self, "_host_loading", False):
             return
+        if not self._host_event_perm(plugin_file, PluginPermission.UI_INJECT,
+                                     "host.action_register", "缺少界面注入权限（注册动作）"):
+            return
         bucket = self.plugin_actions.setdefault(scope, [])
         if any(a.get("id") == action_id and a.get("plugin") == plugin_file for a in bucket):
             return
@@ -7272,10 +8491,17 @@ class PluginManager(QObject):
         plugin = next((p for p in self.plugins if p.filename == plugin_file), None)
         if plugin is None and not getattr(self, "_host_loading", False):
             return
+        if not self._host_event_perm(plugin_file, PluginPermission.PROJECT_TYPE,
+                                     "host.project_type_register", "缺少项目类型扩展权限"):
+            return
         self.plugin_project_types[type_id] = {
             "name": name,
             "description": str(params.get("description") or "")[:200],
             "plugin": plugin_file,
+            "schema": params.get("schema") if isinstance(params.get("schema"), list) else [],
+            "defaults": params.get("defaults") if isinstance(params.get("defaults"), dict) else {},
+            "renderer": str(params.get("renderer") or ""),
+            "version": int(params.get("version") or 1),
         }
         if plugin is not None:
             plugin.log_plugin(f"注册项目类型: {name}")
@@ -7345,6 +8571,7 @@ class PluginManager(QObject):
                 only = []
         self._host_loading = True
         self._host_pending_registrations = []
+        self._host_caller_tokens = {}
         try:
             response = self._request_host({
                 "method": "load_plugins",
@@ -8330,6 +9557,10 @@ class PluginManager(QObject):
             manager = self
             original_getenv = os.getenv
             original_getitem = os._Environ.__getitem__
+            original_setitem = os._Environ.__setitem__
+            original_delitem = os._Environ.__delitem__
+            original_putenv = getattr(os, 'putenv', None)
+            original_unsetenv = getattr(os, 'unsetenv', None)
 
             def guarded_getenv(key, default=None):
                 if manager._plugin_file_frame_ahead(2):
@@ -8345,8 +9576,42 @@ class PluginManager(QObject):
                         f'无环境变量权限（读取环境变量 {key}）')
                 return original_getitem(environ_self, key)
 
+            def guarded_setitem(environ_self, key, value):
+                if manager._plugin_file_frame_ahead(2):
+                    manager.require_permission(
+                        PluginPermission.ENV_WRITE, 'os.environ',
+                        f'无修改环境变量权限（写入环境变量 {key}）')
+                return original_setitem(environ_self, key, value)
+
+            def guarded_delitem(environ_self, key):
+                if manager._plugin_file_frame_ahead(2):
+                    manager.require_permission(
+                        PluginPermission.ENV_WRITE, 'os.environ',
+                        f'无修改环境变量权限（删除环境变量 {key}）')
+                return original_delitem(environ_self, key)
+
+            def guarded_putenv(key, value):
+                if manager._plugin_file_frame_ahead(2):
+                    manager.require_permission(
+                        PluginPermission.ENV_WRITE, 'os.putenv',
+                        f'无修改环境变量权限（写入环境变量 {key}）')
+                return original_putenv(key, value)
+
+            def guarded_unsetenv(key):
+                if manager._plugin_file_frame_ahead(2):
+                    manager.require_permission(
+                        PluginPermission.ENV_WRITE, 'os.unsetenv',
+                        f'无修改环境变量权限（删除环境变量 {key}）')
+                return original_unsetenv(key)
+
             os.getenv = guarded_getenv
             os._Environ.__getitem__ = guarded_getitem
+            os._Environ.__setitem__ = guarded_setitem
+            os._Environ.__delitem__ = guarded_delitem
+            if original_putenv is not None:
+                os.putenv = guarded_putenv
+            if original_unsetenv is not None:
+                os.unsetenv = guarded_unsetenv
             cls._env_patch_installed = True
 
     def _install_thread_context(self):
@@ -8889,7 +10154,9 @@ class PluginManager(QObject):
             "limits": {
                 "plugin_dir": self.plugin_dir,
                 "data_dir": getattr(self.app, "data_dir", ""),
-                "protected_files": ["plugin_security.json", "plugin_settings.json"],
+                "protected_files": ["plugin_security.json", "plugin_settings.json",
+                                    "plugin_public_key.hex", "plugin_private_key.pem",
+                                    "plugin_*.sig", "plugin_share"],
                 "system_dirs": list(self._system_dirs()),
                 "startup_dirs": list(self._startup_dirs()),
                 "blocked_modules": sorted(self._BLOCKED_MODULES),
@@ -9399,7 +10666,11 @@ class PluginManager(QObject):
         p = self._norm_path(path)
         if not p:
             return False
-        if os.path.basename(p) in ("plugin_security.json", "plugin_settings.json"):
+        base = os.path.basename(p).lower()
+        if base in ("plugin_security.json", "plugin_settings.json",
+                    "plugin_public_key.hex", "plugin_private_key.pem"):
+            return True
+        if base.endswith(".sig"):
             return True
         targets = []
         cp = getattr(self.app, 'config_path', '') or ''
@@ -9409,6 +10680,15 @@ class PluginManager(QObject):
         if data_dir:
             targets.append(os.path.join(data_dir, "plugin_security.json"))
             targets.append(os.path.join(data_dir, "plugin_settings.json"))
+            targets.append(os.path.join(data_dir, "plugin_public_key.hex"))
+            targets.append(os.path.join(data_dir, "plugin_private_key.pem"))
+        plugin_dir = getattr(self, 'plugin_dir', '') or ''
+        if plugin_dir:
+            targets.append(os.path.join(plugin_dir, "plugin_public_key.hex"))
+            targets.append(os.path.join(plugin_dir, "plugin_private_key.pem"))
+        share_dir = self._norm_path(os.path.join(data_dir, "plugin_share")) if data_dir else ""
+        if share_dir and (p == share_dir or p.startswith(share_dir + os.sep)):
+            return True
         for target in targets:
             tp = self._norm_path(target)
             if not tp:
@@ -9424,6 +10704,22 @@ class PluginManager(QObject):
             except Exception:
                 continue
         return False
+
+    def _scan_plugin_reflection(self, filepath, filename):
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
+                source = handle.read()
+        except Exception as exc:
+            return f"源码读取失败: {exc}"
+        hits = [pattern for pattern in _PLUGIN_REFLECT_PATTERNS if pattern in source]
+        if not hits:
+            return ""
+        try:
+            self.app.append_security_event(filename, "block", "reflection_scan",
+                                           filepath, "危险反射符号: " + ", ".join(hits))
+        except Exception:
+            pass
+        return "检测到危险反射符号: " + ", ".join(hits)
 
     def _plugin_import(self, name, globals=None, locals=None, fromlist=(), level=0):
         top = str(name).split('.')[0]
@@ -9489,6 +10785,7 @@ class PluginManager(QObject):
                 return
 
         self.plugins.clear()
+        _install_plugin_sdk_proxy()
         self._audit_suppress = True
         try:
             if self.plugin_dir not in sys.path:
@@ -9503,116 +10800,15 @@ class PluginManager(QObject):
                             if not self._verify_signature(filepath):
                                 log_message(f"[插件] {filename} 未通过签名验证，跳过", "WARNING")
                                 continue
+                        reflect_error = self._scan_plugin_reflection(filepath, filename)
+                        if reflect_error:
+                            self.load_errors.append(f"{filename}: {reflect_error}")
+                            log_message(f"[插件] {filename} {reflect_error}，跳过", "ERROR")
+                            continue
                         spec = importlib.util.spec_from_file_location(module_name, filepath)
                         module = importlib.util.module_from_spec(spec)
-                        safe_builtins = {
-                            '__import__': self._plugin_import,
-                            '__build_class__': __build_class__,
-                            'print': print,
-                            'len': len,
-                            'range': range,
-                            'int': int,
-                            'float': float,
-                            'str': str,
-                            'list': list,
-                            'dict': dict,
-                            'tuple': tuple,
-                            'set': set,
-                            'bool': bool,
-                            'bytes': bytes,
-                            'bytearray': bytearray,
-                            'open': open,
-                            'eval': eval,
-                            'exec': exec,
-                            'compile': compile,
-                            'True': True,
-                            'False': False,
-                            'None': None,
-                            'Exception': Exception,
-                            'ValueError': ValueError,
-                            'TypeError': TypeError,
-                            'KeyError': KeyError,
-                            'IndexError': IndexError,
-                            'AttributeError': AttributeError,
-                            'ImportError': ImportError,
-                            'RuntimeError': RuntimeError,
-                            'StopIteration': StopIteration,
-                            'NotImplementedError': NotImplementedError,
-                            'OSError': OSError,
-                            'IOError': IOError,
-                            'PermissionError': PermissionError,
-                            'FileNotFoundError': FileNotFoundError,
-                            'FileExistsError': FileExistsError,
-                            'IsADirectoryError': IsADirectoryError,
-                            'NotADirectoryError': NotADirectoryError,
-                            'TimeoutError': TimeoutError,
-                            'ConnectionError': ConnectionError,
-                            'ZeroDivisionError': ZeroDivisionError,
-                            'ArithmeticError': ArithmeticError,
-                            'OverflowError': OverflowError,
-                            'LookupError': LookupError,
-                            'UnicodeError': UnicodeError,
-                            'UnicodeDecodeError': UnicodeDecodeError,
-                            'UnicodeEncodeError': UnicodeEncodeError,
-                            'BlockingIOError': BlockingIOError,
-                            'InterruptedError': InterruptedError,
-                            'ProcessLookupError': ProcessLookupError,
-                            'RecursionError': RecursionError,
-                            'SystemError': SystemError,
-                            'NameError': NameError,
-                            'UnboundLocalError': UnboundLocalError,
-                            'AssertionError': AssertionError,
-                            'MemoryError': MemoryError,
-                            'BufferError': BufferError,
-                            'Warning': Warning,
-                            'BaseException': BaseException,
-                            'isinstance': isinstance,
-                            'hasattr': hasattr,
-                            'getattr': getattr,
-                            'setattr': setattr,
-                            'delattr': delattr,
-                            'property': property,
-                            'staticmethod': staticmethod,
-                            'classmethod': classmethod,
-                            'super': super,
-                            'object': object,
-                            'type': type,
-                            'enumerate': enumerate,
-                            'zip': zip,
-                            'map': map,
-                            'filter': filter,
-                            'sorted': sorted,
-                            'reversed': reversed,
-                            'min': min,
-                            'max': max,
-                            'sum': sum,
-                            'abs': abs,
-                            'round': round,
-                            'any': any,
-                            'all': all,
-                            'iter': iter,
-                            'next': next,
-                            'ord': ord,
-                            'chr': chr,
-                            'id': id,
-                            'repr': repr,
-                            'dir': dir,
-                            'vars': vars,
-                            'hex': hex,
-                            'oct': oct,
-                            'bin': bin,
-                            'divmod': divmod,
-                            'pow': pow,
-                            'hash': hash,
-                            'slice': slice,
-                            'complex': complex,
-                            'memoryview': memoryview,
-                            'frozenset': frozenset,
-                            'format': format,
-                            'callable': callable,
-                            'input': input,
-                        }
-                        module.__builtins__ = safe_builtins
+                        module.__builtins__ = _fallback_safe_builtins(
+                            self._plugin_import, self._is_protected_file)
 
                         module.Plugin = Plugin
                         module.PluginPermission = PluginPermission
@@ -9623,14 +10819,16 @@ class PluginManager(QObject):
                         if hasattr(module, 'setup'):
                             _plugin_context.current_plugin = None
                             plugin_api = PluginAPI(None, self.app)
+                            setup_app = _PluginAppFacade(self.app)
                             plugin_instance = self._run_guarded(
-                                identity, lambda: module.setup(self.app, plugin_api))
+                                identity, lambda: module.setup(setup_app, plugin_api))
                             if not isinstance(plugin_instance, Plugin):
                                 msg = "setup() 未返回 Plugin 实例"
                                 self.load_errors.append(f"{filename}: {msg}")
                                 log_message(f"[插件] {filename} {msg}，跳过", "ERROR")
                                 continue
                             plugin_instance.filename = filename
+                            plugin_instance.app = setup_app
                             manifest, merr = read_plugin_manifest(self.plugin_dir, module_name)
                             if merr:
                                 self.load_errors.append(f"{filename}: {merr}")
@@ -9715,6 +10913,14 @@ class PluginManager(QObject):
                 signature = f.read()
             public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(self.public_key))
             public_key.verify(signature, content)
+            manifest_path = os.path.splitext(plugin_path)[0] + ".json"
+            manifest_sig = manifest_path + ".sig"
+            if os.path.exists(manifest_path) and os.path.exists(manifest_sig):
+                with open(manifest_path, 'rb') as f:
+                    manifest_content = f.read()
+                with open(manifest_sig, 'rb') as f:
+                    manifest_signature = f.read()
+                public_key.verify(manifest_signature, manifest_content)
             return True
         except ImportError:
             log_message("cryptography 库未安装，无法验证签名", "ERROR")
@@ -9963,11 +11169,17 @@ class PluginManager(QObject):
         score = 0
         triggers = set()
         capabilities = set()
+        seen_modules = set()
+        seen_calls = set()
+        seen_attrs = set()
         obfuscation = 0
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     top = alias.name.split('.')[0]
+                    if top in seen_modules:
+                        continue
+                    seen_modules.add(top)
                     weight = self._CODE_RISK_MODULES.get(top)
                     if weight:
                         score += weight
@@ -9975,6 +11187,9 @@ class PluginManager(QObject):
                             capabilities.add(top)
             elif isinstance(node, ast.ImportFrom):
                 top = (node.module or '').split('.')[0]
+                if top in seen_modules:
+                    continue
+                seen_modules.add(top)
                 weight = self._CODE_RISK_MODULES.get(top)
                 if weight:
                     score += weight
@@ -9989,22 +11204,28 @@ class PluginManager(QObject):
                 else:
                     nm = None
                 if nm:
-                    weight = self._CODE_RISK_CALLS.get(nm)
-                    if weight:
-                        score += weight
-                        if nm in self._CODE_EXEC_TRIGGERS:
-                            triggers.add(nm)
-                    weight = self._CODE_RISK_CALL_ATTRS.get(nm)
-                    if weight:
-                        score += weight
-                        if nm in ("system", "popen", "Popen", "spawn", "spawnl", "execv", "execve"):
-                            capabilities.add(nm)
-                if nm == "open" and len(node.args) >= 2:
-                    mode = node.args[1]
-                    if isinstance(mode, ast.Constant) and isinstance(mode.value, str):
-                        if any(c in mode.value for c in "wax+"):
-                            score += 3
+                    if nm not in seen_calls:
+                        seen_calls.add(nm)
+                        weight = self._CODE_RISK_CALLS.get(nm)
+                        if weight:
+                            score += weight
+                            if nm in self._CODE_EXEC_TRIGGERS:
+                                triggers.add(nm)
+                        weight = self._CODE_RISK_CALL_ATTRS.get(nm)
+                        if weight:
+                            score += weight
+                            if nm in ("system", "popen", "Popen", "spawn", "spawnl", "execv", "execve"):
+                                capabilities.add(nm)
+                    if nm == "open" and len(node.args) >= 2:
+                        mode = node.args[1]
+                        if isinstance(mode, ast.Constant) and isinstance(mode.value, str):
+                            if any(c in mode.value for c in "wax+") and "write_open" not in seen_calls:
+                                seen_calls.add("write_open")
+                                score += 2
             elif isinstance(node, ast.Attribute):
+                if node.attr in seen_attrs:
+                    continue
+                seen_attrs.add(node.attr)
                 weight = self._CODE_RISK_ATTRS.get(node.attr)
                 if weight:
                     score += weight
@@ -10012,13 +11233,13 @@ class PluginManager(QObject):
                         triggers.add(node.attr)
             elif isinstance(node, ast.Constant):
                 value = node.value
-                if isinstance(value, (str, bytes)) and len(value) > 600:
+                if isinstance(value, (str, bytes)) and len(value) > 600 and not obfuscation:
                     score += 2
-                    obfuscation += 1
+                    obfuscation = 1
         if triggers and capabilities:
-            score += 6
+            score += 4
         if triggers and obfuscation:
-            score += 3
+            score += 2
         return score
 
     def assess_code_risk(self, plugin):
@@ -10045,7 +11266,7 @@ class PluginManager(QObject):
         if raw is None:
             level = 1
         else:
-            level = max(1, min(15, 1 + int(raw)))
+            level = max(1, min(15, 1 + int(raw) // 2))
         try:
             if info is not None:
                 self._code_risk_cache[path] = (info.st_mtime, info.st_size, level)
@@ -10156,7 +11377,7 @@ class PluginManager(QObject):
         return True
 
 class Plugin:
-    PLUGIN_SYSTEM_VERSION = "0.15"
+    PLUGIN_SYSTEM_VERSION = "1.0"
 
     def __init__(self):
         self.name = "Unnamed Plugin"
@@ -10177,6 +11398,7 @@ class Plugin:
         self.permission_warnings = []
         self.permission_legacy = False
         self.own_modules = []
+        self.data_exports = {}
         self.enable_error = ""
         self.audit_log = []
         self.emergency_stop = False
@@ -10203,13 +11425,20 @@ class Plugin:
         pass
 
 _PLUGIN_HOST_FLAG = "--plugin-host"
-_PLUGIN_HOST_PROTOCOL = 2
+_PLUGIN_HOST_PROTOCOL = 4
 _PLUGIN_HOST_MAX_LINE = 8 * 1024 * 1024
 _PLUGIN_HOST_EVENT_RATE = 300
 _PLUGIN_HOST_THROTTLED_EVENTS = frozenset({"log", "security", "sensitive", "denied"})
 _PLUGIN_HOOK_NAMES = frozenset({
     "project_create", "project_save", "timer_start", "timer_pause", "timer_reset",
     "timer_expire", "window_close", "theme_change", "config_change", "app_quit",
+    "project_update", "project_delete", "plugin_load", "plugin_unload",
+    "global_view_open", "renderer_apply",
+})
+_PLUGIN_QT_EVENT_NAMES = frozenset({
+    "mouse_press", "mouse_release", "mouse_double_click", "key_press",
+    "key_release", "wheel", "focus_in", "focus_out", "window_show",
+    "window_hide", "window_move", "window_resize",
 })
 _PLUGIN_ACTION_SCOPES = frozenset({"window_menu", "tray_menu", "settings_toolbar"})
 _PLUGIN_HOST_RISK_PATTERNS = (
@@ -10802,13 +12031,87 @@ def _report_dunder(name, action):
         pass
 
 
+_FORBIDDEN_DUNDERS = frozenset({
+    "__subclasses__", "__globals__", "__builtins__", "__code__", "__closure__",
+    "__bases__", "__mro__", "__dict__", "__class__", "__getattribute__",
+    "__setattr__", "__delattr__", "__reduce__", "__reduce_ex__", "__getstate__",
+    "__setstate__", "__loader__", "__spec__", "__self__", "__wrapped__",
+})
+_FORBIDDEN_FRAME_ATTRS = frozenset({
+    "f_globals", "f_builtins", "f_locals", "f_back", "f_code",
+    "gi_frame", "gi_code", "cr_frame", "cr_code", "ag_frame", "ag_code",
+})
+
+
+def _reflection_denial(name, action):
+    return PluginPermissionDenied(
+        f"插件不可通过反射访问 {name}", code="hard.dunder_access",
+        capability="reflection", origin="api", operation=str(action),
+        target=str(name))
+
+
 def _check_dunder(name, action):
     text = str(name)
+    if text in _FORBIDDEN_DUNDERS or text in _FORBIDDEN_FRAME_ATTRS:
+        raise _reflection_denial(text, action)
     if text.startswith("__") and text.endswith("__"):
         _report_dunder(text, action)
 
 
-def _host_safe_builtins(import_fn):
+def _safe_vars(obj=None):
+    if obj is None:
+        return {}
+    source = {}
+    try:
+        if isinstance(obj, type):
+            source = dict(vars(obj))
+        elif hasattr(obj, "__dict__"):
+            source = dict(object.__getattribute__(obj, "__dict__"))
+    except Exception:
+        source = {}
+    return {key: value for key, value in source.items() if not str(key).startswith("_")}
+
+
+def _safe_dir(obj=None):
+    if obj is None:
+        try:
+            return [key for key in sys._getframe(1).f_locals.keys() if not key.startswith("_")]
+        except Exception:
+            return []
+    return [name for name in dir(obj) if not str(name).startswith("__")]
+
+
+def _safe_type(*args):
+    if len(args) == 3:
+        raise PluginPermissionDenied(
+            "插件不可使用三参数 type() 动态创建类型", code="hard.dynamic_type",
+            capability="reflection", origin="api", operation="type",
+            target="type")
+    return type(*args)
+
+
+def _guarded_open(file, mode="r", *args, **kwargs):
+    try:
+        target = os.fspath(file)
+    except Exception:
+        target = ""
+    if target:
+        checker = globals().get("_active_protected_file_check")
+        if callable(checker):
+            try:
+                if checker(target):
+                    raise PluginPermissionDenied(
+                        "插件不可读取或改写安全密钥与签名文件",
+                        code="hard.protected_key", capability="file.protected",
+                        origin="api", operation="open", target=str(target))
+            except PluginPermissionDenied:
+                raise
+            except Exception:
+                pass
+    return open(file, mode, *args, **kwargs)
+
+
+def _host_safe_builtins(import_fn, protected_check=None):
     import builtins as _bi
     allowed = (
         "print", "len", "range", "int", "float", "str", "list", "dict", "tuple",
@@ -10816,9 +12119,10 @@ def _host_safe_builtins(import_fn):
         "setattr", "delattr", "property", "staticmethod", "classmethod", "super",
         "object", "type", "enumerate", "zip", "map", "filter", "sorted", "reversed",
         "min", "max", "sum", "abs", "round", "any", "all", "iter", "next", "ord",
-        "chr", "id", "repr", "dir", "vars", "hex", "oct", "bin", "divmod", "pow",
+        "chr", "id", "repr", "dir", "hex", "oct", "bin", "divmod", "pow",
         "hash", "slice", "complex", "memoryview", "frozenset", "format", "callable",
-        "open", "eval", "exec", "compile", "__build_class__",
+        "open", "eval", "exec", "compile", "__build_class__", "__debug__",
+        "NotImplemented", "Ellipsis",
     )
     table = {}
     for name in allowed:
@@ -10839,25 +12143,51 @@ def _host_safe_builtins(import_fn):
         _check_dunder(name, "setattr"), setattr(obj, name, value))[1]
     table["delattr"] = lambda obj, name: (
         _check_dunder(name, "delattr"), delattr(obj, name))[1]
-    table["vars"] = lambda *items: (_report_dunder("__dict__", "vars"), vars(*items))[1]
-    table["dir"] = lambda *items: (_report_dunder("*", "dir"), dir(*items))[1]
+    table["vars"] = _safe_vars
+    table["dir"] = _safe_dir
+    table["type"] = _safe_type
+    if protected_check is not None:
+        table["open"] = _guarded_open
+        globals()["_active_protected_file_check"] = protected_check
     return table
+
+
+def _fallback_safe_builtins(import_fn, protected_check=None):
+    return _host_safe_builtins(import_fn, protected_check)
+
+
+_HOST_SHIM_RUNTIMES = weakref.WeakKeyDictionary()
+_HOST_API_RUNTIMES = weakref.WeakKeyDictionary()
 
 
 class _HostShimApp:
 
     is_plugin_host_shim = True
 
+    _HIDDEN = frozenset({"_runtime", "guard", "plugin_security", "_auth_perms", "authority"})
+
+    def __getattribute__(self, name):
+        if name in _HostShimApp._HIDDEN and _caller_is_plugin_frame(2, 1):
+            raise _manager_hard_denial(name, "插件不可访问宿主运行时内部")
+        return object.__getattribute__(self, name)
+
     def __setattr__(self, name, value):
-        if name in ("security_center_disabled", "_security_center_disabled") and _caller_is_plugin_frame(2, 1):
+        if name in ("security_center_disabled", "_security_center_disabled",
+                    "global_disable_all_plugins", "plugin_manager") and _caller_is_plugin_frame(2, 1):
             raise PluginPermissionDenied(
-                "插件不可关闭安全中心", code="hard.app_control",
+                "插件不可改写宿主安全状态", code="hard.app_control",
                 capability="security.control", origin="api",
-                operation="app.security_center_disabled", target=name)
+                operation="app." + str(name), target=name)
         object.__setattr__(self, name, value)
 
+    @property
+    def _runtime(self):
+        if _caller_is_plugin_frame(2, 1):
+            raise _manager_hard_denial("_runtime", "插件不可访问宿主运行时")
+        return _HOST_SHIM_RUNTIMES.get(self)
+
     def __init__(self, runtime):
-        self._runtime = runtime
+        _HOST_SHIM_RUNTIMES[self] = runtime
         self.data_dir = runtime.data_dir
         self.config_path = runtime.config_path
         self.global_disable_all_plugins = False
@@ -10893,8 +12223,16 @@ class _HostShimApp:
 
 class HostPluginAPI:
 
+    _HIDDEN = frozenset({"_runtime", "_manager", "__dict__", "_host_query",
+                         "_host_capability", "_require", "_send_event"})
+
+    def __getattribute__(self, name):
+        if name in HostPluginAPI._HIDDEN and _caller_is_plugin_frame(2, 1):
+            raise _manager_hard_denial(name, "插件不可访问宿主 API 内部")
+        return object.__getattribute__(self, name)
+
     def __init__(self, runtime, filename):
-        self._runtime = runtime
+        _HOST_API_RUNTIMES[self] = runtime
         self._filename = filename
         self._plugin = None
         self._denial_callback = None
@@ -10905,6 +12243,12 @@ class HostPluginAPI:
             runtime.register_caller_token(filename, self._token)
         except Exception:
             pass
+
+    @property
+    def _runtime(self):
+        if _caller_is_plugin_frame(2, 1):
+            raise _manager_hard_denial("_runtime", "插件不可访问宿主运行时")
+        return _HOST_API_RUNTIMES.get(self)
 
     def bind(self, plugin):
         self._plugin = plugin
@@ -10917,17 +12261,23 @@ class HostPluginAPI:
 
     @property
     def _app(self):
-        guard = getattr(self._runtime, "guard", None)
+        runtime = self._runtime
+        if runtime is None:
+            return None
+        guard = getattr(runtime, "guard", None)
         if guard is not None and self._plugin is not None:
             try:
                 guard.note_observation(self._plugin, "api.direct_app_access",
-                                       "宿主模式禁止插件直取内部对象", "api", "")
+                                       "插件直取宿主对象，已返回只读代理", "api", "")
             except Exception:
                 pass
-        return guard
+        return getattr(runtime, "shim", None)
 
     def _internal_manager(self):
-        return getattr(self._runtime, "guard", None)
+        if _caller_is_plugin_frame(2, 1):
+            raise _manager_hard_denial("_internal_manager", "插件不可直接获取插件管理器")
+        runtime = self._runtime
+        return getattr(runtime, "guard", None) if runtime is not None else None
 
     def _manager(self):
         guard = self._internal_manager()
@@ -10962,8 +12312,13 @@ class HostPluginAPI:
             return False
         return guard.require_permission(perm, event, reason, plugin=self._plugin)
 
+    def _send_event(self, name, payload):
+        data = dict(payload or {})
+        data["_caller_token"] = self._token
+        self._runtime.send_event(name, data)
+
     def log(self, message, level="INFO"):
-        self._runtime.send_event("log", {"plugin": self._filename, "message": str(message), "level": level})
+        self._send_event("log", {"plugin": self._filename, "message": str(message), "level": level})
 
     def _validate_widget_class(self, id_name, widget_class, kind):
         if not (isinstance(widget_class, type) and issubclass(widget_class, QWidget)):
@@ -10983,7 +12338,7 @@ class HostPluginAPI:
                    "plugin": self._filename}
         if extra:
             payload.update(extra)
-        self._runtime.send_event("register", payload)
+        self._send_event("register", payload)
 
     def register_dynamic_bg(self, id_name, display_name, widget_class, border_radius=None):
         self._require(PluginPermission.UI_INJECT, "register_dynamic_bg", "无界面注入权限（注册动态背景）")
@@ -10993,7 +12348,7 @@ class HostPluginAPI:
                        {"radius": border_radius})
 
     def update_dynamic_bg_radius(self, id_name, border_radius):
-        self._runtime.send_event("radius", {"plugin": self._filename, "id": str(id_name),
+        self._send_event("radius", {"plugin": self._filename, "id": str(id_name),
                                             "radius": border_radius})
         return True
 
@@ -11036,6 +12391,44 @@ class HostPluginAPI:
             "offset": [off_x, off_y],
         })
 
+    def register_ui_slot(self, slot_id, display_name, widget_class,
+                         target="countdown_window", element="countdown",
+                         position="after", size=(320, 120), offset=(0, 0),
+                         replace=False):
+        self._require(PluginPermission.UI_INJECT, "register_ui_slot",
+                      "无界面注入权限（注册语义插槽）")
+        if replace:
+            self._require(PluginPermission.UI_MUTATE, "register_ui_slot",
+                          "无界面改写权限（替换已有元素）")
+        self._validate_widget_class(slot_id, widget_class, "语义插槽")
+        self._check_duplicate(slot_id, "ui_slot")
+        try:
+            width, height = int(size[0]), int(size[1])
+        except Exception:
+            width, height = 320, 120
+        try:
+            off_x, off_y = int(offset[0]), int(offset[1])
+        except Exception:
+            off_x, off_y = 0, 0
+        position = str(position or "after")
+        if position not in ("before", "after", "over", "replace"):
+            position = "after"
+        target = str(target or "countdown_window")
+        if target not in ("countdown_window", "global_overview", "settings", "project_editor"):
+            target = "countdown_window"
+        element = str(element or "countdown")
+        if element not in ("name", "static_text", "countdown", "weather",
+                           "pomodoro", "poem", "tip", "toolbar"):
+            element = "countdown"
+        self._register("ui_slot", slot_id, display_name, widget_class, {
+            "target": target,
+            "element": element,
+            "position": position,
+            "size": [max(40, width), max(24, height)],
+            "offset": [off_x, off_y],
+            "replace": bool(replace),
+        })
+
     def register_widget(self, id_name, display_name, widget_class):
         self._require(PluginPermission.UI_INJECT, "register_widget", "无界面注入权限（注册自定义控件）")
         self._validate_widget_class(id_name, widget_class, "自定义控件")
@@ -11068,21 +12461,49 @@ class HostPluginAPI:
     def set_config(self, key, value):
         self._runtime.set_config(self._filename, key, value)
 
+    def publish_data(self, namespace, key, value):
+        return self._host_capability("data_set", {
+            "namespace": str(namespace), "key": str(key), "value": value,
+        }, 6000, PluginPermission.PLUGIN_DATA_SHARE, "data.publish",
+            "无跨插件数据权限（发布数据）")
+
+    def read_data(self, owner, namespace, key=None):
+        return self._host_capability("data_get", {
+            "owner": str(owner), "namespace": str(namespace),
+            "key": None if key is None else str(key),
+        }, 6000, PluginPermission.PLUGIN_DATA_SHARE, "data.read",
+            "无跨插件数据权限（读取数据）")
+
+    def list_data_namespaces(self, owner=None):
+        return self._host_capability("data_list", {
+            "owner": None if owner is None else str(owner),
+        }, 6000, PluginPermission.PLUGIN_DATA_SHARE, "data.list",
+            "无跨插件数据权限（列出命名空间）")
+
+    def subscribe_data(self, owner, namespace, callback):
+        self._require(PluginPermission.PLUGIN_DATA_SHARE, "data.subscribe",
+                      "无跨插件数据权限（订阅数据）")
+        self._runtime.subscribe_data(str(owner), str(namespace),
+                                     self._filename, callback)
+
+    def unsubscribe_data(self, owner, namespace):
+        self._runtime.unsubscribe_data(str(owner), str(namespace), self._filename)
+
     def show_notification(self, title, message):
         self._require(PluginPermission.NOTIFICATION, "show_notification", "无发送通知权限")
-        self._runtime.send_event("notify", {"title": str(title), "message": str(message)})
+        self._send_event("notify", {"title": str(title), "message": str(message)})
 
     def remove_float_widget(self, widget=None):
         token = str(getattr(widget, "_host_token", "") or "")
         if not token:
             raise RuntimeError("未找到控件标识")
-        self._runtime.send_event("widget_remove", {"plugin": self._filename, "token": token})
+        self._send_event("widget_remove", {"plugin": self._filename, "token": token})
 
     def resize_float_widget(self, widget=None, width=0, height=0, x=None, y=None, final=False):
         token = str(getattr(widget, "_host_token", "") or "")
         if not token:
             raise RuntimeError("未找到控件标识")
-        self._runtime.send_event("widget_resize", {
+        self._send_event("widget_resize", {
             "plugin": self._filename, "token": token,
             "width": int(width), "height": int(height),
             "x": None if x is None else int(x),
@@ -11322,6 +12743,17 @@ class HostPluginAPI:
         self._require(PluginPermission.EVENT_LISTEN, "hook", "无监听事件权限")
         self._runtime.register_hook(str(name), self._filename, callback, priority)
 
+    def on_qt(self, event_type, callback, target="all", throttle_ms=200):
+        self._require(PluginPermission.EVENT_LISTEN, "events.on_qt", "无监听事件权限")
+        self._require(PluginPermission.UI_READ, "events.on_qt", "无读取界面结构权限（Qt 事件）")
+        if str(event_type) not in _PLUGIN_QT_EVENT_NAMES or not callable(callback):
+            raise ValueError("无效的 Qt 事件订阅")
+        self._runtime.subscribe_qt(str(event_type), self._filename, callback,
+                                   str(target or "all"), int(throttle_ms or 200))
+
+    def off_qt(self, event_type):
+        self._runtime.unsubscribe_qt(str(event_type), self._filename)
+
     def register_action(self, scope, action_id, label, callback, icon=""):
         self._require(PluginPermission.UI_INJECT, "register_action", "无界面注入权限（注册工具栏按钮）")
         self._runtime.register_action(str(scope), str(action_id), str(label)[:64],
@@ -11338,11 +12770,32 @@ class HostPluginAPI:
                                f"{detail}（未声明 {flag.name}，观察模式放行）",
                                "host", target)
 
-    def register_project_type(self, type_id, name, description=""):
-        self._observe_contract(PluginPermission.UI_INJECT,
-                               f"注册项目类型 {type_id}", str(type_id))
-        self._runtime.register_project_type(str(type_id), str(name)[:64], self._filename,
-                                            str(description or "")[:200])
+    def register_renderer(self, renderer_id, name, widget_class, description="",
+                          config_schema=None, tick_interval_ms=1000):
+        self._require(PluginPermission.UI_INJECT, "register_renderer", "无界面注入权限（注册倒计时渲染器）")
+        self._validate_widget_class(renderer_id, widget_class, "倒计时渲染器")
+        self._check_duplicate(renderer_id, "renderer")
+        self._register("renderer", renderer_id, name, widget_class, {
+            "description": str(description or "")[:200],
+            "config_schema": config_schema,
+            "tick_interval_ms": int(tick_interval_ms or 1000),
+        })
+
+    def register_project_type(self, type_id, name, description="", schema=None,
+                              defaults=None, editor=None, renderer=None,
+                              resolver=None, scheduler=None, version=1):
+        self._require(PluginPermission.PROJECT_TYPE, "register_project_type",
+                      "无项目类型扩展权限")
+        self._runtime.register_project_type(
+            str(type_id), str(name)[:64], self._filename,
+            str(description or "")[:200],
+            schema=schema if isinstance(schema, list) else [],
+            defaults=defaults if isinstance(defaults, dict) else {},
+            editor=editor,
+            renderer=str(renderer or ""),
+            resolver=resolver if callable(resolver) else None,
+            scheduler=scheduler if callable(scheduler) else None,
+            version=int(version or 1))
 
     def provide_service(self, name, handler):
         self._observe_contract(PluginPermission.PLUGIN_CALL,
@@ -11397,6 +12850,8 @@ class PluginHostRuntime(QObject):
         self.actions = {}
         self.project_types = {}
         self.services = {}
+        self.qt_subscribers = {}
+        self.data_subscribers = {}
         self.providers = {}
         self.weather_providers = {}
         self.card_slots = {}
@@ -11409,7 +12864,7 @@ class PluginHostRuntime(QObject):
         self._buf = b""
         self.shim = _HostShimApp(self)
         self.guard = PluginManager(self.shim)
-        self.shim.plugin_manager = self.guard
+        self.shim.plugin_manager = _PluginManagerFacade(self.guard)
         self.guard.plugin_dir = self.plugin_dir
         self.guard.plugin_configs = self.widget_configs
         self.guard._auth_perms = {}
@@ -11429,6 +12884,7 @@ class PluginHostRuntime(QObject):
     def register_caller_token(self, filename, token):
         with self._ask_lock:
             self._caller_tokens[str(token)] = str(filename)
+        self.send_event("caller_token", {"plugin": str(filename), "token": str(token)})
 
     def send_line(self, payload):
         _audit_guard.active = True
@@ -11442,7 +12898,21 @@ class PluginHostRuntime(QObject):
             _audit_guard.active = False
 
     def send_event(self, name, params):
+        if isinstance(params, dict) and params.get("plugin") and "_caller_token" not in params:
+            token = self._token_for_plugin(str(params.get("plugin") or ""))
+            if token:
+                params = dict(params)
+                params["_caller_token"] = token
         self.send_line({"event": name, "params": params})
+
+    def _token_for_plugin(self, filename):
+        if not filename:
+            return ""
+        with self._ask_lock:
+            for token, name in self._caller_tokens.items():
+                if name == filename:
+                    return token
+        return ""
 
     def request_permission(self, filename, perm, feature, reason, origin, timeout_ms):
         if getattr(self._asking, "busy", False):
@@ -11456,11 +12926,15 @@ class PluginHostRuntime(QObject):
     def _ask_host(self, filename, perm, feature, reason, origin, timeout_ms):
         self._ask_seq += 1
         rid = f"perm-{self._ask_seq}"
+        with self._ask_lock:
+            token = next((tok for tok, name in self._caller_tokens.items()
+                          if name == filename), "")
         waiter = {"event": threading.Event(), "box": {}}
         with self._ask_lock:
             self._ask_waiters[rid] = waiter
         self.send_line({"id": rid, "event": "permission_request", "params": {
-            "plugin": filename, "perm": int(perm), "feature": str(feature or ""),
+            "plugin": filename, "_caller_token": token,
+            "perm": int(perm), "feature": str(feature or ""),
             "reason": str(reason or ""), "origin": str(origin or "explicit"),
             "timeout_ms": int(timeout_ms or 60000),
         }})
@@ -11477,7 +12951,7 @@ class PluginHostRuntime(QObject):
 
     def host_request(self, kind, params, timeout_ms=6000):
         payload = dict(params or {})
-        token = str(payload.pop("_caller_token", "") or "")
+        token = str(payload.get("_caller_token", "") or "")
         caller = getattr(_plugin_context, "current_plugin", None)
         caller_name = getattr(caller, "filename", None) if caller is not None else None
         if not caller_name and token:
@@ -11486,6 +12960,7 @@ class PluginHostRuntime(QObject):
             payload["plugin"] = caller_name
         else:
             payload.pop("plugin", None)
+        payload["_caller_token"] = token
         self._ask_seq += 1
         rid = f"req-{self._ask_seq}"
         waiter = {"event": threading.Event(), "box": {}}
@@ -11613,6 +13088,14 @@ class PluginHostRuntime(QObject):
             return self._destroy_widget(params)
         if method == "widget_call":
             return self._widget_call(params)
+        if method == "project_type_resolve":
+            return self.resolve_project_type(params)
+        if method == "project_type_schedule":
+            return self.schedule_project_type(params)
+        if method == "qt_event":
+            return self._run_qt_event(params)
+        if method == "data_changed":
+            return self._run_data_changed(params)
         if method == "hook":
             return self._run_hook(params)
         if method == "action":
@@ -11700,6 +13183,85 @@ class PluginHostRuntime(QObject):
         bucket.sort(key=lambda item: item[0])
         self.send_event("log", {"plugin": filename, "message": f"注册钩子: {name} (priority={prio})"})
 
+    def subscribe_qt(self, event_type, filename, callback, target="all", throttle_ms=200):
+        if event_type not in _PLUGIN_QT_EVENT_NAMES or not callable(callback):
+            raise ValueError("无效的 Qt 事件订阅")
+        bucket = self.qt_subscribers.setdefault(event_type, [])
+        bucket[:] = [item for item in bucket
+                     if not (item[1] == filename and item[2] == callback)]
+        bucket.append((int(throttle_ms or 200), filename, callback, str(target or "all")))
+        self.send_event("qt_subscribe", {"event": event_type, "plugin": filename})
+
+    def unsubscribe_qt(self, event_type, filename):
+        bucket = self.qt_subscribers.get(event_type, [])
+        bucket[:] = [item for item in bucket if item[1] != filename]
+        if not bucket:
+            self.qt_subscribers.pop(event_type, None)
+        self.send_event("qt_unsubscribe", {"event": event_type, "plugin": filename})
+
+    def _data_owner_key(self, owner):
+        text = str(owner or "")
+        for plugin in self.plugins:
+            if text in (getattr(plugin, "filename", ""), getattr(plugin, "name", "")):
+                text = str(getattr(plugin, "filename", "") or text)
+                break
+        return os.path.splitext(os.path.basename(text))[0]
+
+    def subscribe_data(self, owner, namespace, filename, callback):
+        if not callable(callback):
+            raise ValueError("数据订阅回调必须可调用")
+        key = (self._data_owner_key(owner), str(namespace))
+        bucket = self.data_subscribers.setdefault(key, [])
+        bucket[:] = [item for item in bucket
+                     if not (item[1] == filename and item[2] == callback)]
+        bucket.append((0, filename, callback))
+
+    def unsubscribe_data(self, owner, namespace, filename):
+        key = (self._data_owner_key(owner), str(namespace))
+        bucket = self.data_subscribers.get(key, [])
+        bucket[:] = [item for item in bucket if item[1] != filename]
+        if not bucket:
+            self.data_subscribers.pop(key, None)
+
+    def _run_data_changed(self, params):
+        key = (self._data_owner_key(params.get("owner")), str(params.get("namespace") or ""))
+        data = params.get("data") if isinstance(params.get("data"), dict) else {}
+        for item in list(self.data_subscribers.get(key, [])):
+            plugin = self.by_file.get(item[1])
+            if plugin is None or not plugin.enabled:
+                continue
+            _plugin_context.current_plugin = plugin
+            try:
+                item[2](dict(data))
+            except Exception as e:
+                self.send_event("log", {"plugin": item[1],
+                                        "message": f"数据订阅回调失败: {e}",
+                                        "level": "WARNING"})
+            finally:
+                _plugin_context.current_plugin = None
+        return True
+
+    def _run_qt_event(self, params):
+        event_type = str(params.get("event") or "")
+        role = str(params.get("role") or "")
+        for item in list(self.qt_subscribers.get(event_type, [])):
+            target = item[3]
+            if target not in ("all", role):
+                continue
+            plugin = self.by_file.get(item[1])
+            if plugin is None or not plugin.enabled:
+                continue
+            _plugin_context.current_plugin = plugin
+            try:
+                item[2](dict(params))
+            except Exception as e:
+                self.send_event("log", {"plugin": item[1],
+                                        "message": f"Qt 事件回调失败: {e}",
+                                        "level": "WARNING"})
+            finally:
+                _plugin_context.current_plugin = None
+        return True
+
     def register_action(self, scope, action_id, label, filename, callback, icon=""):
         if scope not in _PLUGIN_ACTION_SCOPES or not callable(callback):
             raise ValueError(f"无效的动作注册: {scope}")
@@ -11711,14 +13273,77 @@ class PluginHostRuntime(QObject):
                                             "label": label, "icon": icon,
                                             "plugin": filename})
 
-    def register_project_type(self, type_id, name, filename, description=""):
+    def register_project_type(self, type_id, name, filename, description="",
+                              schema=None, defaults=None, editor=None, renderer="",
+                              resolver=None, scheduler=None, version=1):
         if not re.fullmatch(r"[A-Za-z0-9_\-.:]{1,64}", type_id):
             raise ValueError(f"非法项目类型 ID: {type_id}")
-        self.project_types[type_id] = {"name": name, "plugin": filename,
-                                       "description": description}
-        self.send_event("project_type_register", {"id": type_id, "name": name,
-                                                  "description": description,
-                                                  "plugin": filename})
+        self.project_types[type_id] = {
+            "name": name,
+            "plugin": filename,
+            "description": description,
+            "schema": schema if isinstance(schema, list) else [],
+            "defaults": defaults if isinstance(defaults, dict) else {},
+            "editor": editor,
+            "renderer": str(renderer or ""),
+            "resolver": resolver if callable(resolver) else None,
+            "scheduler": scheduler if callable(scheduler) else None,
+            "version": int(version or 1),
+        }
+        self.send_event("project_type_register", {
+            "id": type_id,
+            "name": name,
+            "description": description,
+            "plugin": filename,
+            "schema": schema if isinstance(schema, list) else [],
+            "defaults": defaults if isinstance(defaults, dict) else {},
+            "renderer": str(renderer or ""),
+            "version": int(version or 1),
+        })
+
+    def resolve_project_type(self, params):
+        type_id = str(params.get("id") or "")
+        entry = self.project_types.get(type_id)
+        if not isinstance(entry, dict):
+            return None
+        resolver = entry.get("resolver")
+        if not callable(resolver):
+            return None
+        project = params.get("project") if isinstance(params.get("project"), dict) else {}
+        now = str(params.get("now") or datetime.now().isoformat())
+        _plugin_context.current_plugin = self.by_file.get(str(params.get("plugin") or ""))
+        try:
+            result = resolver(project, now)
+        except Exception as e:
+            self.send_event("log", {"plugin": entry.get("plugin", ""),
+                                    "message": f"项目类型解析失败: {e}",
+                                    "level": "ERROR"})
+            return None
+        finally:
+            _plugin_context.current_plugin = None
+        return _host_jsonable(result)
+
+    def schedule_project_type(self, params):
+        type_id = str(params.get("id") or "")
+        entry = self.project_types.get(type_id)
+        if not isinstance(entry, dict):
+            return None
+        scheduler = entry.get("scheduler")
+        if not callable(scheduler):
+            return None
+        project = params.get("project") if isinstance(params.get("project"), dict) else {}
+        now = str(params.get("now") or datetime.now().isoformat())
+        _plugin_context.current_plugin = self.by_file.get(str(params.get("plugin") or ""))
+        try:
+            result = scheduler(project, now)
+        except Exception as e:
+            self.send_event("log", {"plugin": entry.get("plugin", ""),
+                                    "message": f"项目类型调度失败: {e}",
+                                    "level": "ERROR"})
+            return None
+        finally:
+            _plugin_context.current_plugin = None
+        return _host_jsonable(result)
 
     def provide_service(self, name, filename, handler):
         if not re.fullmatch(r"[A-Za-z0-9_\-.:]{1,64}", str(name)):
@@ -12174,6 +13799,8 @@ class PluginHostRuntime(QObject):
         self.actions = {}
         self.project_types = {}
         self.services = {}
+        self.qt_subscribers = {}
+        self.data_subscribers = {}
         self.providers = {}
         self.weather_providers = {}
         self.card_slots = {}
@@ -12231,7 +13858,8 @@ class PluginHostRuntime(QObject):
                     code = compile(source, filepath, "exec")
                     spec = importlib.util.spec_from_file_location(module_name, filepath)
                     module = importlib.util.module_from_spec(spec)
-                    module.__builtins__ = _host_safe_builtins(self._plugin_import)
+                    module.__builtins__ = _host_safe_builtins(
+                        self._plugin_import, self.guard._is_protected_file)
                     module.Plugin = Plugin
                     module.PluginPermission = PluginPermission
                     module.__file__ = filepath
@@ -12336,7 +13964,7 @@ def run_plugin_host(argv):
         return
     main_module = sys.modules.get("__main__")
     if main_module is not None:
-        sys.modules.setdefault("djs_pyqt6", main_module)
+        _install_plugin_sdk_proxy(main_module)
     app = QApplication(sys.argv[:1])
     app.setApplicationName("DJS Plugin Host")
     app.setQuitOnLastWindowClosed(False)
@@ -12637,15 +14265,26 @@ class CountdownProject:
                  gradient_start=None, gradient_end=None,
                  dynamic_bg_type="particles", dynamic_fps=30, dynamic_quality="high", graphics_preset="high",
                  typewriter_interval=15, tip_interval=15, expired_text="已到期",
-                 display_format="decimal", display_format_template="{days}天 {hours}时 {minutes}分",
+                 display_format="auto", display_format_template="{days}天 {hours}时 {minutes}分",
                  click_through=False, recur_weekdays=None, recur_end_date="",
                  recur_mode="weekly", recur_monthday=1, recur_year_month=1, recur_year_day=1,
                  enable_end_sound=True, end_sound_mode="windchime", custom_sound_path="",
                  window_locked=False, fullscreen_layouts=None, bg_settings=None,
                  window_material="solid", window_border_enabled=False,
                  window_border_color="#5B8DEF", window_border_width=2,
-                 skin_id="", skin_mode="auto", skin_variant=""):
+                 skin_id="", skin_mode="auto", skin_variant="",
+                 start_date=None, work_schedule_override=None,
+                 plugin_data=None, renderer_id="builtin.rolling", type_version=1):
         self.project_type = project_type
+        self.start_date = start_date if start_date is not None else datetime.now().strftime("%Y-%m-%d")
+        self.work_schedule_override = dict(work_schedule_override) if isinstance(work_schedule_override, dict) else None
+        self.plugin_data = dict(plugin_data) if isinstance(plugin_data, dict) else {}
+        self.renderer_id = renderer_id or "builtin.rolling"
+        try:
+            self.type_version = max(1, int(type_version))
+        except (TypeError, ValueError):
+            self.type_version = 1
+        self.type_state = {}
         self.click_through = _strict_bool(click_through)
         self.window_locked = _strict_bool(window_locked)
         self.recur_weekdays = recur_weekdays or []
@@ -12735,8 +14374,8 @@ class CountdownProject:
         self.skin_variant = skin_variant if skin_variant in ("light", "dark") else ""
 
     def get_default_size(self, screen_width, screen_height):
-        width = max(360, min(460, int(screen_width * 0.24)))
-        height = max(220, min(300, int(screen_height * 0.28)))
+        width = max(300, min(335, round(screen_width * 0.196)))
+        height = max(190, min(213, round(screen_height * 0.234)))
         return (int(width), int(height))
 
     def to_dict(self):
@@ -12798,7 +14437,12 @@ class CountdownProject:
             "window_border_width": self.window_border_width,
             "skin_id": self.skin_id,
             "skin_mode": self.skin_mode,
-            "skin_variant": self.skin_variant
+            "skin_variant": self.skin_variant,
+            "start_date": self.start_date,
+            "work_schedule_override": self.work_schedule_override,
+            "plugin_data": self.plugin_data,
+            "renderer_id": self.renderer_id,
+            "type_version": self.type_version
         }
 
     @staticmethod
@@ -12842,7 +14486,7 @@ class CountdownProject:
             data.get("typewriter_interval", 15),
             data.get("tip_interval", 15),
             data.get("expired_text", "已到期"),
-            data.get("display_format", "decimal"),
+            data.get("display_format", "auto"),
             data.get("display_format_template", "{days}天 {hours}时 {minutes}分"),
             data.get("click_through", False),
             data.get("recur_weekdays", None),
@@ -12863,7 +14507,12 @@ class CountdownProject:
             data.get("window_border_width", 2),
             data.get("skin_id", ""),
             data.get("skin_mode", "auto"),
-            data.get("skin_variant", "")
+            data.get("skin_variant", ""),
+            data.get("start_date", None),
+            data.get("work_schedule_override", None),
+            data.get("plugin_data", None),
+            data.get("renderer_id", "builtin.rolling"),
+            data.get("type_version", 1)
         )
         normalize_layout_theme_colors(project)
         return project
@@ -15543,6 +17192,46 @@ class TideBackgroundWidget(QWidget):
             self._paint_info(painter, g, ink, negative, t)
 
 
+class StaticGradientBackgroundWidget(QWidget):
+    def __init__(self, parent=None, radius=0, bg_type="aurora", message=""):
+        super().__init__(parent)
+        self.radius = radius
+        self._bg_type = str(bg_type or "aurora")
+        self._message = str(message or "GPU 加速未开启，动态效果已暂停")
+
+    def set_fps(self, *args, **kwargs):
+        pass
+
+    def set_quality(self, *args, **kwargs):
+        pass
+
+    def set_radius(self, radius):
+        self.radius = radius or 0
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), self.radius, self.radius)
+        painter.setClipPath(path)
+        grad = QLinearGradient(0, 0, self.width(), self.height())
+        if self._bg_type == "sky":
+            grad.setColorAt(0.0, QColor("#5C9ED8"))
+            grad.setColorAt(0.55, QColor("#96C6EB"))
+            grad.setColorAt(1.0, QColor("#CDE6F6"))
+        else:
+            grad.setColorAt(0.0, QColor("#071226"))
+            grad.setColorAt(0.45, QColor("#123B4A"))
+            grad.setColorAt(1.0, QColor("#1E5F4E"))
+        painter.fillRect(self.rect(), grad)
+        painter.setPen(QColor(255, 255, 255, 190))
+        font = QFont("Microsoft YaHei", 10)
+        painter.setFont(font)
+        painter.drawText(QRectF(0, self.height() - 42, self.width(), 28),
+                         Qt.AlignmentFlag.AlignCenter, self._message)
+
+
 class AuroraBackgroundWidget(QWidget):
     """3D透视极光背景 - 多层体积光幕 + 透视投影 + 远山剪影"""
     def __init__(self, parent=None, radius=0):
@@ -17692,13 +19381,13 @@ class FullscreenAppearanceDialog(QDialog):
         fps_lay.addWidget(self.fps_combo)
         fps_lay.addStretch()
         lay.addWidget(self.fps_row)
-        self.gpu_hint = QLabel("未开启 GPU 加速，将使用 CPU 渲染（占用高、可能卡顿）")
+        self.gpu_hint = QLabel("极光 / 天空需要 GPU 着色器加速；勾选下方选项后进入全屏会自动启用。")
         self.gpu_hint.setWordWrap(True)
         self.gpu_hint.setStyleSheet("color:#f39c12;font-size:11px;")
         self.gpu_hint.hide()
         lay.addWidget(self.gpu_hint)
         self.gpu_check = QCheckBox("开启 GPU 着色器加速")
-        self.gpu_check.setChecked(True)
+        self.gpu_check.setChecked(bool(getattr(self.window.master, "enable_gpu_acceleration", False)))
         self.gpu_check.hide()
         lay.addWidget(self.gpu_check)
         edit_hint = QLabel("进入全屏后，右下角 → 编辑模式 可拖拽调整布局")
@@ -17779,6 +19468,11 @@ class FullscreenAppearanceDialog(QDialog):
 
     def _on_enter_fullscreen(self):
         key = self.selected_bg
+        if key in ("aurora", "sky") and self.gpu_check.isVisible():
+            if not self.gpu_check.isChecked():
+                QMessageBox.warning(self, "需要 GPU 加速",
+                                    "极光 / 天空背景必须使用 GPU 着色器。\n请勾选“开启 GPU 着色器加速”后再进入全屏。")
+                return
         if self.BG_QUALITY_SUPPORT.get(key, True):
             preset = 'high'
             for pkey, btn in self._preset_buttons.items():
@@ -17796,10 +19490,11 @@ class FullscreenAppearanceDialog(QDialog):
         self.window.project.graphics_preset = preset
         self.window.project.dynamic_quality = preset
         self.window.project.dynamic_fps = fps
-        if self.gpu_check.isVisible() and self.gpu_check.isChecked() and not getattr(self.window.master, 'enable_gpu_acceleration', False):
-            self.window.master.enable_gpu_acceleration = True
-            if hasattr(self.window.master, 'chk_gpu_accel'):
-                self.window.master.chk_gpu_accel.setChecked(True)
+        if key in ("aurora", "sky") and self.gpu_check.isVisible() and self.gpu_check.isChecked():
+            if not getattr(self.window.master, 'enable_gpu_acceleration', False):
+                self.window.master.enable_gpu_acceleration = True
+                if hasattr(self.window.master, 'chk_gpu_accel'):
+                    self.window.master.chk_gpu_accel.setChecked(True)
         try:
             self.window.master.save_config(force=True)
         except Exception:
@@ -18758,6 +20453,7 @@ def play_sound_file(file_path):
 class FlipDigit(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._theme_dark = None
         tokens = get_spec_tokens(is_system_dark())
         self._theme_aware = True
         self._value = "0"
@@ -18786,9 +20482,17 @@ class FlipDigit(QWidget):
         self._color = color
         self.update()
 
+    def setThemeDark(self, dark):
+        self._theme_dark = None if dark is None else bool(dark)
+        self.refresh_theme()
+
     def refresh_theme(self):
-        tokens = get_spec_tokens(is_system_dark())
+        dark = is_system_dark() if self._theme_dark is None else self._theme_dark
+        tokens = get_spec_tokens(dark)
         self._color = tokens["digit_text"]
+        self._card_color = QColor(tokens["digit_bg_bottom"])
+        self._card_highlight = QColor(tokens["digit_bg_top"])
+        self._card_shadow = QColor(tokens["digit_bg_bottom"])
         self._theme_aware = True
         self.update()
 
@@ -18830,7 +20534,8 @@ class FlipDigit(QWidget):
         radius = 12
         painter.setPen(Qt.PenStyle.NoPen)
         if self._theme_aware:
-            tokens = get_spec_tokens(is_system_dark())
+            dark = is_system_dark() if self._theme_dark is None else self._theme_dark
+            tokens = get_spec_tokens(dark)
             grad = QLinearGradient(0, 0, 0, h)
             grad.setColorAt(0.0, QColor(tokens["digit_bg_top"]))
             grad.setColorAt(1.0, QColor(tokens["digit_bg_bottom"]))
@@ -18970,6 +20675,7 @@ class FlipClockWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._enable_flip = True
+        self._theme_dark = None
         tokens = get_spec_tokens(is_system_dark())
         self._color = tokens["digit_text"]
         self._card_color = tokens["digit_bg_top"]
@@ -19006,12 +20712,19 @@ class FlipClockWidget(QWidget):
         for d in self.digits:
             d.setCardColor(color)
 
+    def setThemeDark(self, dark):
+        self._theme_dark = None if dark is None else bool(dark)
+        for d in self.digits:
+            d.setThemeDark(self._theme_dark)
+        self.refresh_theme()
+
     def refresh_theme(self):
-        tokens = get_spec_tokens(is_system_dark())
+        dark = is_system_dark() if self._theme_dark is None else self._theme_dark
+        tokens = get_spec_tokens(dark)
         self._color = tokens["digit_text"]
         self._card_color = tokens["digit_bg_top"]
         for d in self.digits:
-            d.refresh_theme()
+            d.setThemeDark(self._theme_dark)
         for c in self.colons:
             c.setStyleSheet(f"color: {tokens['colon']}; font-weight: bold;")
 
@@ -19559,6 +21272,13 @@ class ExamModeConfigDialog(QDialog):
         self.chk_flip.setChecked(cfg.get("flip", True))
         form.addRow(self.chk_flip)
 
+        self.combo_clock_theme = QComboBox()
+        self.combo_clock_theme.addItem("深色", "dark")
+        self.combo_clock_theme.addItem("浅色", "light")
+        _clock_theme_index = self.combo_clock_theme.findData(cfg.get("clock_theme", "dark"))
+        self.combo_clock_theme.setCurrentIndex(_clock_theme_index if _clock_theme_index >= 0 else 0)
+        form.addRow("翻页时钟主题", self.combo_clock_theme)
+
         color_row = QHBoxLayout()
         self.btn_color = QPushButton()
         self.btn_color.setFixedSize(40, 24)
@@ -19615,6 +21335,7 @@ class ExamModeConfigDialog(QDialog):
             "unit": unit,
             "tip": self.edit_tip.text().strip() or "沉着冷静，认真应答",
             "flip": self.chk_flip.isChecked(),
+            "clock_theme": self.combo_clock_theme.currentData() or "dark",
             "bg_color": self._bg_color,
         }
 
@@ -19665,6 +21386,7 @@ class ExamModeWindow(QWidget):
 
         self.clock = FlipClockWidget(self)
         self.clock.setEnableFlip(config.get("flip", True))
+        self.clock.setThemeDark(str(config.get("clock_theme", "dark")) != "light")
         clock_row = QHBoxLayout()
         clock_row.addStretch()
         clock_row.addWidget(self.clock)
@@ -20169,7 +21891,9 @@ def build_elem_stylesheet(cfg):
     stroke_color = cfg.get("stroke_color", "transparent")
     border = f"border: {stroke_w}px solid {stroke_color};" if stroke_w > 0 and stroke_color != "transparent" else "border: none;"
     padding = "padding: 2px 8px;" if bg != "transparent" else ""
-    return f"color: {color}; font-size: {cfg.get('font_size', 14)}pt; background-color: {bg}; border-radius: {radius}px; {border} {padding}"
+    family = str(cfg.get("font_family") or "").strip()
+    family_rule = f'font-family: "{family}";' if family else ""
+    return f"color: {color}; {family_rule} font-size: {cfg.get('font_size', 14)}pt; background-color: {bg}; border-radius: {radius}px; {border} {padding}"
 
 
 GLASS_INDIGO = "#5B8DEF"
@@ -20305,6 +22029,49 @@ def draw_hairline_pointer(painter, center, angle_deg, inner_r, outer_r, color, w
     painter.restore()
 
 
+class DecorativeShapeWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._shape_cfg = {}
+
+    def set_config(self, cfg):
+        self._shape_cfg = dict(cfg or {})
+        self.update()
+
+    def paintEvent(self, event):
+        cfg = self._shape_cfg
+        opacity = max(0.0, min(1.0, float(cfg.get("opacity", 1.0) or 0)))
+        if opacity <= 0.0:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        fill = QColor(str(cfg.get("color", "#4facfe")))
+        if not fill.isValid():
+            fill = QColor("#4facfe")
+        fill.setAlpha(int(fill.alpha() * opacity))
+        stroke = QColor(str(cfg.get("stroke_color", "transparent")))
+        stroke_w = max(0.0, float(cfg.get("stroke_width", 0) or 0))
+        radius = max(0.0, float(cfg.get("bg_radius", 8) or 0))
+        rect = QRectF(self.rect()).adjusted(stroke_w / 2.0, stroke_w / 2.0,
+                                            -stroke_w / 2.0, -stroke_w / 2.0)
+        if fill.alpha() > 0:
+            painter.setBrush(QBrush(fill))
+        else:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+        if stroke_w > 0 and stroke.isValid() and stroke.alpha() > 0:
+            pen = QPen(stroke)
+            pen.setWidthF(stroke_w)
+            painter.setPen(pen)
+        elif stroke_w > 0:
+            painter.setPen(Qt.PenStyle.NoPen)
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+        if str(cfg.get("shape_type", "rectangle")) == "circle":
+            painter.drawEllipse(rect)
+        else:
+            painter.drawRoundedRect(rect, radius, radius)
+
+
 def compute_elem_size(w, elem_id, cfg, win_w, win_h, apply=True):
     custom_w = cfg.get("custom_width")
     custom_h = cfg.get("custom_height")
@@ -20333,18 +22100,105 @@ def compute_elem_size(w, elem_id, cfg, win_w, win_h, apply=True):
 
 def paint_project_background(painter, rect, project, material, radius, image_pixmap=None):
     bg_type = project.background_type
+    path = QPainterPath()
+    path.addRoundedRect(rect, radius, radius)
+    painter.save()
+    painter.setClipPath(path)
     if bg_type == "color":
         bg_color = QColor(project.bg_color)
-        if material == "glass":
-            bg_color.setAlpha(int(project.window_alpha * 100))
-        elif material == "frost":
-            bg_color.setAlpha(int(project.window_alpha * 200))
-        else:
+        if material not in ("glass", "frost"):
             bg_color.setAlpha(int(project.window_alpha * 255))
-        painter.fillRect(rect, bg_color)
-        painter.setPen(QPen(QColor(255, 255, 255, 60), 1))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
+            painter.fillRect(rect, bg_color)
+        if material in ("glass", "frost"):
+            frost = material == "frost"
+            base = QColor(project.bg_color)
+            if not base.isValid():
+                base = QColor("#FFFFFF")
+            alpha = max(0, min(255, int(project.window_alpha * (150 if frost else 64))))
+            top = QColor(base)
+            bottom = QColor(base)
+            if base.lightness() > 160:
+                top = top.lighter(108)
+                bottom = bottom.darker(104)
+            else:
+                top = top.lighter(124)
+                bottom = bottom.darker(88)
+            top.setAlpha(min(255, alpha + 22))
+            bottom.setAlpha(max(0, alpha - 10))
+            body = QLinearGradient(rect.topLeft(), rect.bottomRight())
+            body.setColorAt(0.0, top)
+            body.setColorAt(0.55, QColor(base.red(), base.green(), base.blue(), alpha))
+            body.setColorAt(1.0, bottom)
+            painter.fillRect(rect, body)
+            if not frost:
+                painter.fillRect(rect, QColor(118, 172, 255, 12))
+            else:
+                rng = random.Random(20261114)
+                painter.setPen(Qt.PenStyle.NoPen)
+                density = min(1800, max(240, int(rect.width() * rect.height() / 240)))
+                for _ in range(density):
+                    px = rng.uniform(rect.left(), rect.right())
+                    py = rng.uniform(rect.top(), rect.bottom())
+                    dot_r = rng.uniform(0.5, 1.7)
+                    if rng.random() < 0.34:
+                        painter.setBrush(QColor(30, 38, 52, rng.randint(6, 18)))
+                    else:
+                        painter.setBrush(QColor(255, 255, 255, rng.randint(16, 40)))
+                    painter.drawEllipse(QPointF(px, py), dot_r, dot_r)
+            spec = QRadialGradient(
+                QPointF(rect.left() + rect.width() * 0.16, rect.top() + rect.height() * 0.08),
+                max(rect.width(), rect.height()) * 0.82)
+            spec.setColorAt(0.0, QColor(255, 255, 255, 58 if frost else 68))
+            spec.setColorAt(0.28, QColor(255, 255, 255, 16))
+            spec.setColorAt(0.65, QColor(255, 255, 255, 6))
+            spec.setColorAt(1.0, QColor(255, 255, 255, 0))
+            painter.fillRect(rect, spec)
+            caustic = QRadialGradient(
+                QPointF(rect.left() + rect.width() * 0.86, rect.top() + rect.height() * 0.88),
+                max(rect.width(), rect.height()) * 0.45)
+            caustic.setColorAt(0.0, QColor(255, 255, 255, 24 if frost else 30))
+            caustic.setColorAt(1.0, QColor(255, 255, 255, 0))
+            painter.fillRect(rect, caustic)
+            if not frost:
+                streak = QPolygonF([
+                    QPointF(rect.left() + rect.width() * 0.08, rect.top()),
+                    QPointF(rect.left() + rect.width() * 0.20, rect.top()),
+                    QPointF(rect.left() + rect.width() * 0.04, rect.bottom()),
+                    QPointF(rect.left(), rect.bottom()),
+                ])
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(255, 255, 255, 12))
+                painter.drawPolygon(streak)
+            rim = QLinearGradient(rect.topLeft(), rect.bottomRight())
+            rim.setColorAt(0.0, QColor(255, 255, 255, 110))
+            rim.setColorAt(0.45, QColor(255, 255, 255, 54))
+            rim.setColorAt(0.72, QColor(255, 255, 255, 16))
+            rim.setColorAt(1.0, QColor(255, 255, 255, 78))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QBrush(rim), 1.4))
+            painter.drawRoundedRect(rect.adjusted(0.7, 0.7, -0.7, -0.7), radius, radius)
+            inner = QColor(255, 255, 255, 26 if frost else 34)
+            painter.setPen(QPen(inner, 1))
+            painter.drawRoundedRect(rect.adjusted(2.4, 2.4, -2.4, -2.4),
+                                    max(0.0, radius - 2.0), max(0.0, radius - 2.0))
+            shade = QLinearGradient(rect.left(), rect.bottom() - 18, rect.left(), rect.bottom())
+            shade.setColorAt(0.0, QColor(0, 0, 0, 0))
+            shade.setColorAt(1.0, QColor(0, 0, 0, 10 if frost else 14))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.fillRect(QRectF(rect.left(), rect.bottom() - 18, rect.width(), 18), shade)
+            dark_rim = QLinearGradient(rect.topLeft(), rect.bottomRight())
+            dark_rim.setColorAt(0.0, QColor(0, 0, 0, 0))
+            dark_rim.setColorAt(0.58, QColor(0, 0, 0, 0))
+            dark_rim.setColorAt(1.0, QColor(0, 0, 0, 12 if frost else 9))
+            painter.setPen(QPen(QBrush(dark_rim), 1.2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(rect.adjusted(1.2, 1.2, -1.2, -1.2),
+                                    max(0.0, radius - 1.0), max(0.0, radius - 1.0))
+        else:
+            painter.setPen(QPen(QColor(255, 255, 255, 60), 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
     elif bg_type == "gradient":
         grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
         grad.setColorAt(0.0, QColor(project.gradient_start))
@@ -20356,6 +22210,7 @@ def paint_project_background(painter, rect, project, material, radius, image_pix
     elif bg_type == "image":
         if image_pixmap is not None and not image_pixmap.isNull():
             painter.drawPixmap(rect.toRect(), image_pixmap)
+    painter.restore()
 
 
 def paint_dynamic_preview_frame(painter, rect, bg_type):
@@ -20509,6 +22364,115 @@ class _MenuDangerRow(QWidget):
         super().mouseReleaseEvent(event)
 
 
+class RendererAdapter(QWidget):
+    def __init__(self, inner, project, app, parent=None):
+        super().__init__(parent)
+        self.inner = inner
+        self.project = project
+        self.app = app
+        self._snapshot = None
+        self._display_format = getattr(project, "display_format", "auto")
+        self._display_format_template = getattr(project, "display_format_template", FORMAT_PRESET_DHM)
+        self._expired = False
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(inner)
+
+    def set_state(self, snapshot):
+        self._snapshot = snapshot
+        text, unit, uses_seconds = format_snapshot_display(
+            snapshot, self._display_format, self._display_format_template)
+        self._expired = bool(snapshot.expired and self._display_format != "countup")
+        context = {
+            "project": getattr(self.project, "name", ""),
+            "target": snapshot.target.isoformat() if snapshot.target is not None else "",
+            "now": snapshot.now.isoformat() if snapshot.now is not None else "",
+            "total_seconds": snapshot.total_seconds,
+            "remaining_days": snapshot.remaining_days,
+            "elapsed_days": snapshot.elapsed_days,
+            "overdue_seconds": snapshot.overdue_seconds,
+            "work_seconds": snapshot.work_seconds,
+            "work_days": snapshot.work_days,
+            "work_days_float": snapshot.work_days_float,
+            "daily_hours": snapshot.daily_hours,
+            "holiday_name": snapshot.holiday_name,
+            "expired": snapshot.expired,
+            "display_text": text,
+            "display_unit": unit,
+            "uses_seconds": uses_seconds,
+            "static_text": snapshot.static_text,
+            "format": self._display_format,
+            "template": self._display_format_template,
+            "theme": get_theme_colors(getattr(self.app, "theme", get_system_theme())),
+        }
+        setter = getattr(self.inner, "set_context", None)
+        if callable(setter):
+            try:
+                setter(context)
+            except Exception:
+                pass
+
+    def uses_seconds(self):
+        if self._snapshot is None:
+            return False
+        return bool(format_snapshot_display(
+            self._snapshot, self._display_format, self._display_format_template)[2])
+
+    def set_display_format(self, fmt, template=FORMAT_PRESET_DHM):
+        self._display_format = fmt
+        self._display_format_template = template
+        if self._snapshot is not None:
+            self.set_state(self._snapshot)
+
+    def showExpired(self, text=None):
+        self._expired = True
+        handler = getattr(self.inner, "show_expired", None)
+        if callable(handler):
+            try:
+                handler(text or "")
+            except Exception:
+                pass
+
+    def set_neon_config(self, *args, **kwargs):
+        handler = getattr(self.inner, "set_neon_config", None)
+        if callable(handler):
+            try:
+                handler(*args, **kwargs)
+            except Exception:
+                pass
+
+    def set_card_style(self, *args, **kwargs):
+        handler = getattr(self.inner, "set_card_style", None)
+        if callable(handler):
+            try:
+                handler(*args, **kwargs)
+            except Exception:
+                pass
+
+    def blinkInfo(self):
+        return {"enabled": False, "active": False, "visible": True,
+                "interval_ms": 500, "expired": self._expired}
+
+    def setBlinkEnabled(self, _enabled):
+        return None
+
+    def setBlinkSpeed(self, _ms):
+        return None
+
+    def stopBlink(self):
+        return None
+
+    def startBlink(self, _interval=None):
+        return None
+
+    def sizeHint(self):
+        hint = self.inner.sizeHint()
+        if hint is None or hint.isEmpty():
+            return QSize(220, 60)
+        return hint
+
+
 class CountdownWindow(QWidget):
     def __init__(self, master, project, index):
         super().__init__()
@@ -20542,6 +22506,8 @@ class CountdownWindow(QWidget):
 
         self.is_fullscreen = False
         self.is_pomodoro = False
+        self._snapshot = None
+        self._snapshot_key = None
 
         if self.project.background_type == "transparent":
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -20830,6 +22796,7 @@ class CountdownWindow(QWidget):
                     f"color: {name_cfg.get('color', '#FFFFFF')};"
                     f"background-color: {name_cfg.get('bg_color', 'rgba(0,0,0,0.25)')};"
                     f"border-radius: {name_cfg.get('bg_radius', 16)}px; border: none;"
+                    f"font-family: \"{name_cfg.get('font_family') or font.family()}\";"
                     f"font-size: {name_cfg.get('font_size', 28)}pt;")
                 self.project_label.adjustSize()
                 nw = max(self.project_label.width(), int(name_cfg.get("width", 0.30) * win_w))
@@ -20845,17 +22812,34 @@ class CountdownWindow(QWidget):
             static_cfg = layout.get("static_text", {})
             if static_cfg.get("visible", True):
                 self.static_label.show()
+                font_size = max(10, static_cfg.get("font_size", 18))
+                self.static_label.setWordWrap(False)
                 font = QFont(self.master.global_font if self.master.current_theme != "system_native" else "Microsoft YaHei",
-                             max(10, static_cfg.get("font_size", 18)))
+                             font_size)
                 font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
                 self.static_label.setFont(font)
                 self.static_label.setStyleSheet(
                     f"color: {static_cfg.get('color', '#E0E0E0')};"
                     f"background-color: {static_cfg.get('bg_color', 'transparent')};"
                     f"border-radius: {static_cfg.get('bg_radius', 0)}px; border: none;"
-                    f"font-size: {static_cfg.get('font_size', 18)}pt;")
+                    f"font-family: \"{static_cfg.get('font_family') or font.family()}\";"
+                    f"font-size: {font_size}pt;")
                 self.static_label.adjustSize()
-                sw = max(self.static_label.width(), int(static_cfg.get("width", 0.40) * win_w))
+                avail = max(60, win_w - 12)
+                desired = self.static_label.sizeHint().width() + 4
+                cfg_w = int(static_cfg.get("width", 0.40) * win_w)
+                sw = min(max(desired, cfg_w), avail)
+                if desired > avail and font_size > 8:
+                    fitted = max(8, int(font_size * avail / max(1, desired)))
+                    font.setPointSize(fitted)
+                    self.static_label.setFont(font)
+                    self.static_label.setStyleSheet(
+                        f"color: {static_cfg.get('color', '#E0E0E0')};"
+                        f"background-color: {static_cfg.get('bg_color', 'transparent')};"
+                        f"border-radius: {static_cfg.get('bg_radius', 0)}px; border: none;"
+                        f"font-size: {fitted}pt;")
+                    self.static_label.adjustSize()
+                    sw = min(max(self.static_label.width(), cfg_w), avail)
                 sh = max(self.static_label.height(), int(static_cfg.get("height", 0.06) * win_h))
                 sx = int(static_cfg.get("x", 0.5) * win_w) - sw // 2
                 sy = int(static_cfg.get("y", 0.14) * win_h) - sh // 2
@@ -21177,16 +23161,34 @@ class CountdownWindow(QWidget):
         layout["weather"]["visible"] = False
         return layout
 
+    def _create_countdown_renderer(self):
+        renderer_id = getattr(self.project, "renderer_id", "builtin.rolling") or "builtin.rolling"
+        if renderer_id != "builtin.rolling":
+            manager = getattr(self.master, "plugin_manager", None)
+            registry = getattr(manager, "plugin_renderers", {}) or {}
+            entry = registry.get(renderer_id)
+            if entry is not None:
+                enabled = any(getattr(plugin, "name", "") == entry.get("plugin")
+                              and getattr(plugin, "enabled", False)
+                              for plugin in getattr(manager, "plugins", []) or [])
+                if enabled:
+                    try:
+                        inner = entry["class"](parent=self)
+                        return RendererAdapter(inner, self.project, self.master, self)
+                    except Exception as e:
+                        log_message(f"创建倒计时渲染器 {renderer_id} 失败: {e}", "ERROR")
+        return RollingNumberLabel("0.000 天", self)
+
     def init_ui(self):
         self.project_label = QLabel(self.project.name, self)
         self.project_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.countdown_label = RollingNumberLabel("0.000 天", self)
+        self.countdown_label = self._create_countdown_renderer()
         self.countdown_label.set_neon_config(self.project.use_neon, self.project.neon_start,
                                              self.project.neon_end, self.project.neon_glow, self.project.font_color)
         self.countdown_label.enable_flip_animation = getattr(getattr(self, 'master', None), 'enable_flip_animation', True)
         self.static_label = QLabel("", self)
         self.static_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.static_label.setWordWrap(True)
+        self.static_label.setWordWrap(False)
         static_shadow = QGraphicsDropShadowEffect(self)
         static_shadow.setBlurRadius(6)
         static_shadow.setColor(QColor(0, 0, 0, 150))
@@ -21235,8 +23237,11 @@ class CountdownWindow(QWidget):
         self._boarding_poem_timer.timeout.connect(self._update_boarding_poem)
 
         self.custom_widgets = {}
+        self._custom_widgets = self.custom_widgets
         self.plugin_slot_widgets = {}
+        self.dynamic_slot_widgets = {}
         self._ensure_plugin_slots()
+        self._ensure_dynamic_slots()
         for key, cfg in self.project.custom_layout.items():
             if key.startswith("custom_text_"):
                 lbl = QLabel(cfg.get("text", ""), self)
@@ -21441,9 +23446,86 @@ class CountdownWindow(QWidget):
                 return bool(plugin.enabled)
         return False
 
+    def _ensure_dynamic_slots(self):
+        manager = getattr(self.master, "plugin_manager", None)
+        registry = getattr(manager, "plugin_ui_slots", {}) or {}
+        widgets = getattr(self, "dynamic_slot_widgets", {})
+        for slot_id, info in registry.items():
+            if info.get("target") != "countdown_window":
+                continue
+            if slot_id in widgets:
+                continue
+            if not self._plugin_slot_available(info):
+                continue
+            try:
+                widget = info["class"](self)
+            except Exception as e:
+                log_message(f"创建语义插槽 {slot_id} 失败: {e}", "ERROR")
+                continue
+            widget.setVisible(True)
+            widget.raise_()
+            widgets[slot_id] = widget
+        for slot_id in list(widgets.keys()):
+            info = registry.get(slot_id)
+            if info is None or info.get("target") != "countdown_window" or not self._plugin_slot_available(info):
+                widget = widgets.pop(slot_id)
+                try:
+                    widget.deleteLater()
+                except Exception:
+                    pass
+        self.dynamic_slot_widgets = widgets
+
+    def _layout_dynamic_slots(self):
+        widgets = getattr(self, "dynamic_slot_widgets", {})
+        if not widgets:
+            return
+        manager = getattr(self.master, "plugin_manager", None)
+        registry = getattr(manager, "plugin_ui_slots", {}) or {}
+        element_map = {
+            "name": getattr(self, "project_label", None),
+            "static_text": getattr(self, "static_label", None),
+            "countdown": getattr(self, "countdown_label", None),
+            "weather": getattr(self, "weather_label", None),
+            "pomodoro": getattr(self, "pomodoro_widget", None),
+            "poem": getattr(self, "poem_label", None),
+            "tip": getattr(self, "tip_hint_widget", None),
+        }
+        win_w, win_h = max(1, self.width()), max(1, self.height())
+        for slot_id, widget in widgets.items():
+            info = registry.get(slot_id) or {}
+            target = element_map.get(info.get("element") or "countdown")
+            if target is None or not target.isVisible():
+                widget.hide()
+                continue
+            size = info.get("size") or [320, 120]
+            try:
+                width, height = max(40, int(size[0])), max(24, int(size[1]))
+            except Exception:
+                width, height = 320, 120
+            offset = info.get("offset") or [0, 0]
+            try:
+                off_x, off_y = int(offset[0]), int(offset[1])
+            except Exception:
+                off_x, off_y = 0, 0
+            rect = target.geometry()
+            position = info.get("position") or "after"
+            if position == "before":
+                x, y = rect.left() - width - 6, rect.center().y() - height // 2
+            elif position == "over":
+                x, y = rect.left(), rect.top()
+            else:
+                x, y = rect.right() + 6, rect.center().y() - height // 2
+            x = max(0, min(x + off_x, win_w - width))
+            y = max(0, min(y + off_y, win_h - height))
+            widget.setGeometry(QRect(int(x), int(y), width, height))
+            widget.raise_()
+            if not widget.isVisible():
+                widget.show()
+
     def _layout_plugin_slots(self):
         widgets = getattr(self, 'plugin_slot_widgets', {})
         if not widgets:
+            self._layout_dynamic_slots()
             return
         registry = getattr(self.master, 'plugin_card_slots', {}) or {}
         win_w, win_h = max(1, self.width()), max(1, self.height())
@@ -21493,6 +23575,7 @@ class CountdownWindow(QWidget):
             widget.raise_()
             if not widget.isVisible():
                 widget.show()
+        self._layout_dynamic_slots()
 
     def _remove_all_plugin_slots(self):
         for widget in list(getattr(self, 'plugin_slot_widgets', {}).values()):
@@ -21500,7 +23583,13 @@ class CountdownWindow(QWidget):
                 widget.deleteLater()
             except Exception:
                 pass
+        for widget in list(getattr(self, 'dynamic_slot_widgets', {}).values()):
+            try:
+                widget.deleteLater()
+            except Exception:
+                pass
         self.plugin_slot_widgets = {}
+        self.dynamic_slot_widgets = {}
 
     def _inject_plugin_actions(self):
         pm = getattr(self.master, 'plugin_manager', None)
@@ -21963,6 +24052,13 @@ class CountdownWindow(QWidget):
                     self._push_tide_info(initial=True)
                     debug_print("setup_dynamic_bg: 使用 TideBackgroundWidget (QPainter)")
                 elif bg_type == "aurora":
+                    if not gpu_enabled and HAS_OPENGL:
+                        try:
+                            self.master.enable_gpu_acceleration = True
+                            gpu_enabled = True
+                            log_message("极光背景需要 GPU 渲染，已自动启用 GPU 加速", "WARNING")
+                        except Exception:
+                            gpu_enabled = False
                     shader_ok = False
                     if gpu_enabled and HAS_OPENGL:
                         try:
@@ -21971,12 +24067,20 @@ class CountdownWindow(QWidget):
                             shader_ok = True
                             debug_print("setup_dynamic_bg: 使用 AuroraShaderWidget (GPU)")
                         except Exception as e:
-                            debug_print(f"AuroraShaderWidget 创建失败，回退 CPU 版: {e}")
+                            debug_print(f"AuroraShaderWidget 创建失败: {e}")
                             self.bg_dynamic_widget = None
                     if not shader_ok or self.bg_dynamic_widget is None:
-                        self.bg_dynamic_widget = AuroraBackgroundWidget(self, radius=radius)
-                        debug_print("setup_dynamic_bg: 使用 AuroraBackgroundWidget (CPU)")
+                        self.bg_dynamic_widget = StaticGradientBackgroundWidget(
+                            self, radius=radius, bg_type="aurora",
+                            message="GPU 着色器不可用，极光动态效果已暂停")
                 elif bg_type == "sky":
+                    if not gpu_enabled and HAS_OPENGL:
+                        try:
+                            self.master.enable_gpu_acceleration = True
+                            gpu_enabled = True
+                            log_message("天空背景需要 GPU 渲染，已自动启用 GPU 加速", "WARNING")
+                        except Exception:
+                            gpu_enabled = False
                     shader_ok = False
                     if gpu_enabled and HAS_OPENGL:
                         try:
@@ -21985,11 +24089,12 @@ class CountdownWindow(QWidget):
                             shader_ok = True
                             debug_print("setup_dynamic_bg: 使用 SkyShaderWidget (GPU)")
                         except Exception as e:
-                            debug_print(f"SkyShaderWidget 创建失败，回退 CPU 版: {e}")
+                            debug_print(f"SkyShaderWidget 创建失败: {e}")
                             self.bg_dynamic_widget = None
                     if not shader_ok or self.bg_dynamic_widget is None:
-                        self.bg_dynamic_widget = SkyBackgroundWidget(self, radius=radius)
-                        debug_print("setup_dynamic_bg: 使用 SkyBackgroundWidget (CPU)")
+                        self.bg_dynamic_widget = StaticGradientBackgroundWidget(
+                            self, radius=radius, bg_type="sky",
+                            message="GPU 着色器不可用，天空动态效果已暂停")
                 else:
                     self.bg_dynamic_widget = DynamicWallpaperWidget(self, wallpaper_type=bg_type, radius=radius)
                 if not self.is_fullscreen:
@@ -22158,6 +24263,7 @@ class CountdownWindow(QWidget):
         if getattr(self, '_bg_needs_rebuild', False):
             self._bg_needs_rebuild = False
             QTimer.singleShot(0, self.setup_dynamic_bg)
+        self._apply_round_mask()
         super().showEvent(event)
 
     def apply_custom_layout(self, skip_style=False):
@@ -22193,7 +24299,8 @@ class CountdownWindow(QWidget):
             "poem": self.poem_label
         }
 
-        default_static = compute_static_text(self.project)
+        default_static = (self._snapshot.static_text if self._snapshot is not None
+                          else compute_static_text(self.project, app=self.master))
 
         offset_x = 0.0
         offset_y = 0.0
@@ -22222,6 +24329,13 @@ class CountdownWindow(QWidget):
             w.setVisible(True)
 
             if not skip_style:
+                if isinstance(w, DecorativeShapeWidget):
+                    w.set_config(cfg)
+                elif cfg.get("type") == "divider":
+                    _div_color = QColor(cfg.get("color", "#666666"))
+                    _div_radius = cfg.get("bg_radius", 2)
+                    w.setStyleSheet(
+                        f"background-color: {_div_color.name()}; border: none; border-radius: {_div_radius}px;")
                 if elem_id == "static_text":
                     w.setText(cfg.get("text", "") or default_static)
                 elif elem_id == "name":
@@ -22244,6 +24358,10 @@ class CountdownWindow(QWidget):
                 stroke_color = cfg.get("stroke_color", "transparent")
                 stylesheet = build_elem_stylesheet(cfg)
                 if elem_id == "countdown" and isinstance(w, RollingNumberLabel):
+                    _count_family = str(cfg.get("font_family") or "").strip()
+                    w.setStyleSheet(
+                        f'font-family: "{_count_family}"; font-size: {cfg.get("font_size", 28)}pt;'
+                        if _count_family else "")
                     w.set_card_style(bg, radius, stroke_w, stroke_color)
                     w.set_neon_config(
                         getattr(self.project, "use_neon", True),
@@ -22307,6 +24425,19 @@ class CountdownWindow(QWidget):
             x = int(pct_x * win_w) - cw // 2
             y = int(pct_y * win_h) - ch // 2
             w.move(x, y)
+
+        for elem_id, widget in list(self.custom_widgets.items()):
+            if elem_id in layout:
+                continue
+            if isinstance(widget, DecorativeShapeWidget) or elem_id.startswith(
+                    ("custom_text_", "custom_image_", "deco_shape_", "divider_")):
+                try:
+                    widget.hide()
+                except RuntimeError:
+                    pass
+        for elem_id in ("name", "static_text", "countdown"):
+            if elem_id not in layout and standard.get(elem_id) is not None:
+                standard[elem_id].hide()
 
         if not skip_style and self.drag_hint_label.isVisible():
             self.drag_hint_label.adjustSize()
@@ -22395,26 +24526,11 @@ class CountdownWindow(QWidget):
         if not hasattr(self, '_custom_widgets'):
             self._custom_widgets = {}
         if elem_id not in self._custom_widgets:
-            shape_widget = QWidget(self)
+            shape_widget = DecorativeShapeWidget(self)
             shape_widget.setObjectName(f"shape_{elem_id}")
             self._custom_widgets[elem_id] = shape_widget
         widget = self._custom_widgets[elem_id]
-        shape_type = config.get("shape_type", "rectangle")
-        bg_color = QColor(config.get("color", "#4facfe"))
-        opacity = config.get("opacity", 1.0)
-        stroke_color = QColor(config.get("stroke_color", "#3498db"))
-        stroke_w = config.get("stroke_width", 2)
-        radius = config.get("bg_radius", 8)
-        style = f"""
-            QWidget#shape_{elem_id} {{
-                background-color: {bg_color.name() if shape_type == 'rectangle' else 'transparent'};
-                border: {stroke_w}px solid {stroke_color.name() if stroke_color.name() != 'transparent' else 'transparent'};
-                border-radius: {radius if shape_type == 'rectangle' else 9999}px;
-                opacity: {opacity};
-            }}
-        """
-        widget.setStyleSheet(style)
-        widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        widget.set_config(config)
         return widget
 
     def _get_or_create_divider(self, elem_id, config):
@@ -22456,7 +24572,7 @@ class CountdownWindow(QWidget):
 
     def update_countdown(self):
         if self.is_pomodoro and self.pomodoro_end_time:
-            diff = self.pomodoro_end_time - datetime.now()
+            diff = self.pomodoro_end_time - app_now()
             if diff.total_seconds() <= 0:
                 self.static_label.setText("🎉 专注完成！")
                 self.is_pomodoro = False
@@ -22466,13 +24582,10 @@ class CountdownWindow(QWidget):
                 self.static_label.setText(f"专注倒计时 {mins:02d}:{secs:02d}")
             return
 
-        eff_date, eff_time = get_effective_target(self.project)
-        is_recurring = getattr(self.project, 'project_type', 'normal') == 'recurring'
-        if is_recurring and eff_date is None:
-            self._set_static_text("🔁 循环已结束")
-            self.project_label.setText(self.project.name)
-            return
-        self._set_static_text(compute_static_text(self.project))
+        if self._snapshot is None:
+            self._snapshot = compute_countdown_snapshot(self.project, app=self.master)
+        snapshot = self._snapshot
+        self._set_static_text(snapshot.static_text)
         self.project_label.setText(self.project.name)
         self._update_boarding_pass()
 
@@ -22545,34 +24658,39 @@ class CountdownWindow(QWidget):
         if self.is_pomodoro and self.pomodoro_end_time:
             return
         try:
-            eff_date, eff_time = get_effective_target(self.project)
-            if eff_date is None:
-                self._last_total_seconds = 0
-                self._update_boarding_pass()
-                if not self.countdown_label._expired:
-                    self._emit_timer_expire("no_target")
-                    self._maybe_play_end_sound()
-                    self.countdown_label.showExpired("已结束")
-                return
-            target = datetime.strptime(f"{eff_date} {eff_time}", "%Y-%m-%d %H:%M")
-            now = app_now()
-            diff = target - now
-            total_seconds = diff.total_seconds()
-            if total_seconds <= 0:
+            snapshot = compute_countdown_snapshot(self.project, app=self.master)
+            self._snapshot = snapshot
+            if snapshot.target is None:
+                was_expired = bool(getattr(self, "expired", False))
                 self.expired = True
                 self._last_total_seconds = 0
+                self.countdown_label.showExpired("已结束")
+                self._set_static_text(snapshot.static_text)
                 self._update_boarding_pass()
-                if not self.countdown_label._expired:
+                if not was_expired:
+                    self._emit_timer_expire("no_target")
+                    self._maybe_play_end_sound()
+                return
+            if snapshot.expired:
+                was_expired = bool(getattr(self, "expired", False))
+                self.expired = True
+                self._last_total_seconds = 0
+                self.countdown_label.set_state(snapshot)
+                self._set_static_text(snapshot.static_text)
+                self._update_boarding_pass()
+                if not was_expired:
                     self._emit_timer_expire("expired")
                     self._maybe_play_end_sound()
-                    self.countdown_label.showExpired(self.project.expired_text)
                 return
-            natural_days = total_seconds / 86400.0
             self.expired = False
-            self._last_total_seconds = total_seconds
-            self.countdown_label.setValue(natural_days)
+            self._last_total_seconds = snapshot.total_seconds
+            self.countdown_label.set_state(snapshot)
+            _interval = 250 if self.countdown_label.uses_seconds() else 1000
+            if self.tick_timer.interval() != _interval:
+                self.tick_timer.setInterval(_interval)
+            self._set_static_text(snapshot.static_text)
             if self.is_fullscreen and self.fullscreen_flip_clock and self.fullscreen_flip_clock.isVisible():
-                self.fullscreen_flip_clock.setTime(total_seconds)
+                self.fullscreen_flip_clock.setTime(snapshot.total_seconds)
             self._update_boarding_pass()
             self._push_tide_info()
         except Exception as e:
@@ -22766,6 +24884,13 @@ class CountdownWindow(QWidget):
         apply_widget_effect(widget, cfg)
         widget.show()
         widget.raise_()
+        if getattr(self, "_fs_editing", False):
+            overlay = getattr(self, "_fs_edit_overlay", None)
+            if overlay is not None and overlay.isVisible():
+                overlay.raise_()
+                toolbar = getattr(self, "_fs_edit_toolbar", None)
+                if toolbar is not None and toolbar.isVisible():
+                    toolbar.raise_()
 
     def enter_fullscreen_edit(self):
         if not self.is_fullscreen:
@@ -22997,7 +25122,7 @@ class CountdownWindow(QWidget):
     def _apply_window_material(self):
         material = getattr(self.project, "window_material", "solid")
         self._material = material
-        if material == "solid" or self.project.background_type != "color":
+        if material in ("solid", "glass", "frost") or self.project.background_type != "color":
             try:
                 apply_modern_window_effect(int(self.winId()), enable=False)
             except Exception:
@@ -23064,7 +25189,13 @@ class CountdownWindow(QWidget):
             self.clearMask()
             self._mask_active = True
         except Exception:
-            self._mask_active = False
+            try:
+                path = QPainterPath()
+                path.addRoundedRect(QRectF(self.rect()), radius, radius)
+                self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+                self._mask_active = True
+            except Exception:
+                self._mask_active = False
 
     def set_alpha(self, val):
         self.project.window_alpha = val
@@ -23321,7 +25452,9 @@ class PreviewCanvas(QWidget):
                     pass
         self._elem_cache.clear()
 
-        default_static = compute_static_text(self.project)
+        editor_window = getattr(self.editor, "window", None)
+        preview_app = getattr(editor_window, "master", None)
+        default_static = compute_static_text(self.project, app=preview_app)
 
         for elem_id, cfg in layout.items():
             try:
@@ -23375,6 +25508,8 @@ class PreviewCanvas(QWidget):
         elif want == "typewriter":
             w = TypewriterLabel(self._stage)
             w._show_cursor = False
+        elif want == "shape":
+            w = DecorativeShapeWidget(self._stage)
         elif want == "weather":
             w = CircularWeatherWidget(self._stage)
         elif want == "pomodoro":
@@ -23512,19 +25647,9 @@ class PreviewCanvas(QWidget):
         if e_type == "custom_image":
             self._load_stage_image(w, cfg, win_w, win_h)
         elif e_type == "deco_shape":
-            shape_type = cfg.get("shape_type", "rectangle")
-            bg_color = QColor(cfg.get("color", "#4facfe"))
-            stroke_color = QColor(cfg.get("stroke_color", "#3498db"))
-            stroke_w = cfg.get("stroke_width", 2)
-            radius = cfg.get("bg_radius", 8)
             w.setObjectName(f"shape_{elem_id}")
-            w.setStyleSheet(f"""
-                QWidget#shape_{elem_id} {{
-                    background-color: {bg_color.name() if shape_type == 'rectangle' else 'transparent'};
-                    border: {stroke_w}px solid {stroke_color.name() if stroke_color.name() != 'transparent' else 'transparent'};
-                    border-radius: {radius if shape_type == 'rectangle' else 9999}px;
-                }}
-            """)
+            if isinstance(w, DecorativeShapeWidget):
+                w.set_config(cfg)
         elif e_type == "divider":
             color = QColor(cfg.get("color", "#666666"))
             radius = cfg.get("bg_radius", 2)
@@ -23555,6 +25680,8 @@ class PreviewCanvas(QWidget):
         if elem_id == "countdown" and isinstance(w, RollingNumberLabel):
             w.set_card_style(bg, radius, stroke_w, stroke_color)
         if isinstance(w, QLabel):
+            if elem_id in ("name", "static_text"):
+                w.setWordWrap(False)
             w.setStyleSheet(stylesheet)
         elif isinstance(w, TypewriterLabel):
             w._text_color_hex = resolve_elem_text_color(self.project, elem_id, cfg, color)
@@ -24294,7 +26421,9 @@ def setup(app, api):
             <li><code>PluginPermission.NETWORK</code> - 网络访问</li>
             <li><code>PluginPermission.COMMAND</code> - 执行系统命令</li>
             <li><code>PluginPermission.CLIPBOARD</code> - 剪贴板读写</li>
-            <li><code>PluginPermission.ENV_READ</code> - 读取/修改环境变量</li>
+            <li><code>PluginPermission.ENV_READ</code> - 读取环境变量</li>
+            <li><code>PluginPermission.ENV_WRITE</code> - 修改或删除环境变量</li>
+            <li><code>PluginPermission.PROJECT_TYPE</code> - 定义项目类型 schema、编辑器、解析器与调度器</li>
             <li><code>PluginPermission.THREAD_SPAWN</code> - 创建线程</li>
             <li><code>PluginPermission.UI_INJECT</code> - 注册界面控件与工具栏按钮</li>
             <li><code>PluginPermission.EVENT_LISTEN</code> - 订阅应用事件</li>
@@ -24329,7 +26458,10 @@ def setup(app, api):
             <li><code>api.hook(name, callback, priority)</code> - 订阅事件钩子，返回 <code>allow</code> / <code>modify</code> / <code>deny</code></li>
             <li>钩子名：<code>project_create</code>、<code>project_save</code>、<code>timer_start</code>、<code>timer_pause</code>、<code>timer_reset</code>、<code>timer_expire</code>、<code>window_close</code>、<code>theme_change</code>、<code>config_change</code>、<code>app_quit</code></li>
             <li><code>api.register_action(scope, id, label, callback, icon)</code> - <code>window_menu</code> / <code>tray_menu</code> / <code>settings_toolbar</code></li>
-            <li><code>api.register_project_type(id, name, description)</code> - 新项目类型</li>
+            <li><code>api.register_project_type(id, name, description, schema, defaults, editor, renderer, resolver, scheduler, version)</code> - 新项目类型，可带字段 schema、默认值、编辑器、渲染器、解析器与调度器（需 <code>PROJECT_TYPE</code>）；<code>scheduler(project, now)</code> 每 60 秒执行一次并写回 <code>type_state</code>，<code>editor(parent)</code> 返回控件并通过 <code>values()</code> 回写字段</li>
+            <li><code>api.register_renderer(id, name, widget_class, description, config_schema, tick_interval_ms)</code> - 替换倒计时渲染器（需 <code>UI_INJECT</code>）</li>
+            <li><code>api.register_ui_slot(slot_id, name, widget_class, anchor, size, offset)</code> - 相对已有元素插入或覆盖界面控件（需 <code>UI_INJECT</code>）</li>
+            <li><code>api.events.on_qt(event_type, callback, target, throttle_ms)</code> - 订阅受限的鼠标、键盘、滚轮、焦点与窗口事件（需 <code>EVENT_LISTEN</code> 与 <code>UI_READ</code>）</li>
         </ul>
 
         <h3>数据源、天气源与服务</h3>
@@ -24338,7 +26470,7 @@ def setup(app, api):
             <li><code>api.register_weather_provider(id, name, handler)</code> - 天气源，出现在全局天气源下拉框</li>
             <li><code>api.provide_service(name, handler)</code> / <code>api.call_service(name, *args)</code> - 跨插件公开服务（双方都需 <code>PLUGIN_CALL</code>）</li>
             <li><code>api.has_service(name)</code> / <code>api.list_services()</code> - 查询可用服务</li>
-            <li><code>PLUGIN_DATA_SHARE</code> 仅为预留权限位，当前版本没有 <code>exports.data</code> 文件共享接口；跨插件数据请走公开服务或事件</li>
+            <li><code>api.publish_data(namespace, key, value)</code> / <code>api.read_data(namespace, key, default)</code> / <code>api.list_data_namespaces()</code> / <code>api.subscribe_data(namespace, callback)</code> - 命名空间化的跨插件 JSON 数据共享，对方清单需通过 <code>exports.data</code> 公开命名空间（需 <code>PLUGIN_DATA_SHARE</code>）</li>
         </ul>
 
         <h3>宿主内省与自省</h3>
@@ -24372,6 +26504,10 @@ def setup(app, api):
             <li><b>权限检查</b>：任何敏感操作都会检查插件是否拥有对应权限，否则抛出异常。</li>
             <li><b>签名验证</b>（可选）：开发者可使用 Ed25519 对插件签名，应用加载前验证。</li>
             <li><b>用户授权</b>：启用插件时必须用户确认其请求的权限。</li>
+            <li><b>权限权威收口</b>：插件只能拿到只读宿主代理与只读插件管理器门面，无法通过 <code>api._app</code>、<code>api._internal_manager()</code> 或运行时内部引用修改授权状态；宿主回传的请求必须携带调用令牌，主进程按令牌识别插件。</li>
+            <li><b>反射硬拦截</b>：<code>__subclasses__</code>、<code>__globals__</code>、<code>__code__</code>、<code>__bases__</code>、<code>__mro__</code>、<code>__dict__</code>、<code>__class__</code> 与帧属性会直接拒绝，源码中出现这些符号的插件在加载前被拦截。</li>
+            <li><b>环境变量读写分离</b>：读取需要 <code>ENV_READ</code>，写入、删除、<code>os.putenv</code> 与 <code>os.unsetenv</code> 需要 <code>ENV_WRITE</code>。</li>
+            <li><b>插件 SDK 代理</b>：插件导入 <code>djs_pyqt6</code> 只能获得白名单符号，无法借模块全局访问审计器、插件管理器或插件上下文。</li>
             <li><b>信任模式（按插件）</b>：可在插件安全中心为单个插件开启信任模式，需要图形验证码；开启后该插件不再记录放行审计并放宽文件路径，但未授权的命令与进程创建、危险模块导入、写入程序自身文件与插件源码、写入开机启动项、读取其它插件源码仍会被硬拦。撤销无需验证码并立即生效。</li>
             <li><b>日志监控</b>：所有插件行为均记录在案，可在日志面板查看。</li>
         </ul>
@@ -24968,31 +27104,21 @@ def _css_color(value, fallback="#000000"):
 
 
 def _skin_preview_countdown(project):
-    target = None
-    try:
-        eff_date, eff_time = get_effective_target(project)
-        target = datetime.strptime(f"{eff_date} {eff_time or '00:00'}", "%Y-%m-%d %H:%M")
-    except Exception:
-        target = None
-    if target is None:
+    snapshot = compute_countdown_snapshot(project)
+    if snapshot.target is None:
         return "128", " 天"
-    days_float = max(0.0, (target - app_now()).total_seconds() / 86400.0)
-    fmt = getattr(project, "display_format", "decimal") or "decimal"
-    if fmt == "integer":
-        return str(int(days_float)), " 天"
-    if fmt == "hms":
-        total = int(days_float * 86400)
-        d, h, m = total // 86400, (total % 86400) // 3600, (total % 3600) // 60
-        return (f"{d}天 {h}时 {m}分" if d > 0 else f"{h}时 {m}分"), ""
-    if fmt == "custom":
-        template = getattr(project, "display_format_template", FORMAT_PRESET_DHM) or FORMAT_PRESET_DHM
-        return render_format_template(template, days_float), ""
-    return f"{days_float:.3f}", " 天"
+    fmt = getattr(project, "display_format", "auto") or "auto"
+    template = getattr(project, "display_format_template", FORMAT_PRESET_DHM) or FORMAT_PRESET_DHM
+    text, unit, _uses_seconds = format_snapshot_display(snapshot, fmt, template)
+    if not text:
+        return "0", " 天"
+    return text, unit
 
 
 def _skin_preview_texts(project):
     digits, unit = _skin_preview_countdown(project)
-    return project.name, digits, unit, compute_static_text(project)
+    snapshot = compute_countdown_snapshot(project)
+    return project.name, digits, unit, compute_static_text(project, snapshot=snapshot)
 
 
 class SkinPreviewWidget(QWidget):
@@ -26018,6 +28144,8 @@ class AppearanceEditor(QDialog):
             "neon_end": getattr(project, "neon_end", "#38f9d7"),
             "neon_glow": getattr(project, "neon_glow", "#38f9d7"),
             "auto_font": getattr(project, "auto_font", True),
+            "display_format": getattr(project, "display_format", "auto"),
+            "display_format_template": getattr(project, "display_format_template", FORMAT_PRESET_DHM),
             "skin_id": getattr(project, "skin_id", ""),
             "skin_variant": getattr(project, "skin_variant", ""),
             "skin_mode": getattr(project, "skin_mode", ""),
@@ -26535,10 +28663,10 @@ class AppearanceEditor(QDialog):
         self.btn_color.clicked.connect(self._pick_color)
         self.btn_color.setStyleSheet(f"QPushButton {{ border-radius: 6px; border: 1px solid {get_theme_colors(self.current_theme)['border_color']}; }}")
         color_layout = QHBoxLayout()
-        lbl_color = QLabel("文字颜色")
-        lbl_color.setFixedWidth(80)
-        lbl_color.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        color_layout.addWidget(lbl_color)
+        self.lbl_color = QLabel("文字颜色")
+        self.lbl_color.setFixedWidth(80)
+        self.lbl_color.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        color_layout.addWidget(self.lbl_color)
         color_layout.addStretch()
         color_layout.addWidget(self.btn_color)
         self.color_row = QWidget()
@@ -26678,8 +28806,15 @@ class AppearanceEditor(QDialog):
         self.btn_bg_color.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_bg_color.clicked.connect(lambda: self._pick_color_attr("bg_color"))
         self.btn_bg_color.setStyleSheet(f"QPushButton {{ border-radius: 4px; border: 1px solid {get_theme_colors(self.current_theme)['border_color']}; }}")
+        self.btn_bg_clear = QPushButton("清除")
+        self.btn_bg_clear.setFixedHeight(22)
+        self.btn_bg_clear.setProperty("secondary", True)
+        self.btn_bg_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_bg_clear.setToolTip("移除元素背景，恢复透明")
+        self.btn_bg_clear.clicked.connect(self._clear_element_bg)
         bg_color_layout.addStretch()
         bg_color_layout.addWidget(self.btn_bg_color)
+        bg_color_layout.addWidget(self.btn_bg_clear)
 
         radius_layout = QHBoxLayout()
         lbl_radius = QLabel("圆角")
@@ -26801,7 +28936,7 @@ class AppearanceEditor(QDialog):
         cd_fmt_layout.addWidget(lbl_format)
         self.combo_display_format = QComboBox()
         self.combo_display_format.addItems([
-            "小数 (天)", "整数 (天)", "天时分", "时分秒", "自定义模板"
+            "智能（自动）", "小数 (天)", "整数 (天)", "天时分", "时分秒", "正计时", "自定义模板"
         ])
         self.combo_display_format.currentIndexChanged.connect(self._on_display_format_changed)
         cd_fmt_layout.addWidget(self.combo_display_format)
@@ -27760,6 +29895,12 @@ class AppearanceEditor(QDialog):
         for _k, _v in self._win_backup.items():
             setattr(self.project, _k, _v)
         if self.window:
+            try:
+                self.window.countdown_label.set_display_format(
+                    self.project.display_format, self.project.display_format_template)
+                self.window.update_ticking_countdown()
+            except Exception:
+                pass
             self.window.apply_custom_layout()
             if self._material_backup != "solid" and self.project.background_type == "color":
                 self.window.setWindowOpacity(1.0)
@@ -28010,8 +30151,30 @@ class AppearanceEditor(QDialog):
         self._load_element_properties(self.current_elem)
 
     def go_to_plugin_help(self):
-        if self.window and self.window.master:
-            self.window.master.open_settings(tab="help", section="🛠️ 开发插件 - 快速开始")
+        app = getattr(self.window, "master", None) if self.window else None
+        if app is None:
+            return
+        try:
+            dlg = getattr(app, "_skin_help_dlg", None)
+            if dlg is None or not dlg.isVisible():
+                dlg = QDialog(self)
+                dlg.setWindowTitle("倒计时·DJS - 皮肤帮助")
+                dlg.resize(980, 680)
+                help_layout = QVBoxLayout(dlg)
+                help_layout.setContentsMargins(0, 0, 0, 0)
+                help_tab = HelpTab(app, dlg)
+                help_layout.addWidget(help_tab)
+                dlg._help_tab = help_tab
+                app._skin_help_dlg = dlg
+            dlg._help_tab.navigate_to("皮肤入门")
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception:
+            try:
+                app.open_settings(tab="help", section="皮肤入门")
+            except Exception:
+                pass
 
     def _load_element_properties(self, elem_id):
         self._updating_ui = True
@@ -28084,7 +30247,10 @@ class AppearanceEditor(QDialog):
         bg = elem.get("bg_color", "transparent")
         self.btn_bg_color.setStyleSheet(f"background-color: {{bg}}; border-radius: 4px; border: 1px solid {{border_color}};".format(bg=bg, border_color=get_theme_colors(self.current_theme)['border_color']))
         self.btn_bg_color.setProperty("color_value", bg)
+        self.btn_bg_clear.setEnabled(str(bg) != "transparent")
         self.spin_bg_radius.setValue(elem.get("bg_radius", 0))
+        self.lbl_color.setText("图形颜色" if e_type == "deco_shape"
+                               else ("线条颜色" if e_type == "divider" else "文字颜色"))
 
         align_h = elem.get("alignment_h", "center")
         self.combo_align_h.setCurrentIndex(["左", "中", "右"].index(align_h) if align_h in ["左","中","右"] else 1)
@@ -28140,21 +30306,22 @@ class AppearanceEditor(QDialog):
         if elem_id == "countdown":
             self.edit_expired_text.setText(self.project.expired_text)
             tmpl = getattr(self.project, 'display_format_template', '{days}天 {hours}时 {minutes}分')
-            fmt = getattr(self.project, 'display_format', 'decimal')
+            fmt = getattr(self.project, 'display_format', 'auto')
             if fmt == "custom":
                 if tmpl == "{days}天 {hours}时 {minutes}分":
-                    fmt_idx = 2
-                elif tmpl == "{hours}时 {minutes}分 {seconds}秒":
                     fmt_idx = 3
-                else:
+                elif tmpl == "{hours}时 {minutes}分 {seconds}秒":
                     fmt_idx = 4
+                else:
+                    fmt_idx = 6
             else:
-                fmt_idx = {"decimal": 0, "integer": 1, "hms": 3}.get(fmt, 0)
+                fmt_idx = {"auto": 0, "decimal": 1, "integer": 2,
+                           "dhms": 3, "hms": 4, "countup": 5}.get(fmt, 0)
             self.combo_display_format.blockSignals(True)
             self.combo_display_format.setCurrentIndex(fmt_idx)
             self.combo_display_format.blockSignals(False)
             self.edit_format_template.setText(tmpl)
-            self.custom_template_row.setVisible(fmt_idx == 4)
+            self.custom_template_row.setVisible(fmt_idx == 6)
             self.chk_neon.blockSignals(True)
             self.chk_neon.setChecked(getattr(self.project, 'use_neon', True))
             self.chk_neon.blockSignals(False)
@@ -28184,7 +30351,7 @@ class AppearanceEditor(QDialog):
         else:
             elem["custom_width"] = self.slider_width.value()
             elem["custom_height"] = self.slider_height.value()
-        elem["font_family"] = self.combo_font_family.currentText()
+        elem["font_family"] = self.combo_font_family.currentFont().family() or self.combo_font_family.currentText()
         elem["color"] = self.btn_color.property("color_value") or "#FFFFFF"
         if self.current_elem in _AUTO_TEXT_ELEMENTS:
             elem["auto_color"] = self.cb_auto_text_color.isChecked()
@@ -28248,8 +30415,9 @@ class AppearanceEditor(QDialog):
                 ELEMENT_DISPLAY_NAMES[self.current_elem] = f"文字 {elem['text'][:10]}"
         if self.current_elem == "countdown":
             self.project.expired_text = self.edit_expired_text.text()
-            fmt_map = {0: "decimal", 1: "integer", 2: "custom", 3: "custom", 4: "custom"}
-            self.project.display_format = fmt_map.get(self.combo_display_format.currentIndex(), "decimal")
+            fmt_map = {0: "auto", 1: "decimal", 2: "integer", 3: "dhms",
+                       4: "hms", 5: "countup", 6: "custom"}
+            self.project.display_format = fmt_map.get(self.combo_display_format.currentIndex(), "auto")
             self.project.display_format_template = self.edit_format_template.text()
             if self.window and hasattr(self.window, 'countdown_label'):
                 self.window.countdown_label.set_display_format(
@@ -28407,6 +30575,26 @@ class AppearanceEditor(QDialog):
         self.btn_color.setStyleSheet(f"background-color: {{c}}; border-radius: 6px; border: 1px solid {{bc}};".format(c=display_color, bc=get_theme_colors(self.current_theme)['border_color']))
         self._on_property_changed()
 
+    def _clear_element_bg(self):
+        if self._updating_ui or not self.current_elem:
+            return
+        layout = self.project.custom_layout
+        if self.current_elem not in layout:
+            return
+        layout[self.current_elem]["bg_color"] = "transparent"
+        layout[self.current_elem]["bg_radius"] = 0
+        self._updating_ui = True
+        self.btn_bg_color.setStyleSheet(
+            f"background-color: transparent; border-radius: 4px; border: 1px solid {get_theme_colors(self.current_theme)['border_color']};")
+        self.btn_bg_color.setProperty("color_value", "transparent")
+        self.spin_bg_radius.setValue(0)
+        self.btn_bg_clear.setEnabled(False)
+        self._updating_ui = False
+        self.preview_canvas.refresh_layout()
+        if self.window:
+            self.window.apply_custom_layout()
+        self._mark_dirty()
+
     def _pick_color_attr(self, attr_name):
         btn_map = {
             "stroke_color": self.btn_stroke_color,
@@ -28419,6 +30607,8 @@ class AppearanceEditor(QDialog):
         if color.isValid():
             btn.setStyleSheet(f"background-color: {{c}}; border-radius: 4px; border: 1px solid {{bc}};".format(c=color.name(), bc=get_theme_colors(self.current_theme)['border_color']))
             btn.setProperty("color_value", color.name())
+            if attr_name == "bg_color":
+                self.btn_bg_clear.setEnabled(True)
             self._on_property_changed()
 
     def _on_slider_changed(self, val):
@@ -28527,15 +30717,15 @@ class AppearanceEditor(QDialog):
             self.window.master.save_config(force=True)
 
     def _on_display_format_changed(self, index):
-        if index == 2:
+        if index == 3:
             self.edit_format_template.blockSignals(True)
             self.edit_format_template.setText("{days}天 {hours}时 {minutes}分")
             self.edit_format_template.blockSignals(False)
-        elif index == 3:
+        elif index == 4:
             self.edit_format_template.blockSignals(True)
             self.edit_format_template.setText("{hours}时 {minutes}分 {seconds}秒")
             self.edit_format_template.blockSignals(False)
-        self.custom_template_row.setVisible(index == 4)
+        self.custom_template_row.setVisible(index == 6)
         self._on_property_changed()
 
     def _insert_template_token(self, token):
@@ -28690,6 +30880,10 @@ class AppearanceEditor(QDialog):
                 layout[elem_id]["custom_height"] = 112
         self.project.custom_layout = layout
         self._populate_element_list()
+        self.preview_canvas.refresh_layout()
+        if self.window:
+            self.window.apply_custom_layout()
+        self._mark_dirty()
 
     def remove_element(self):
         if not self.current_elem: return
@@ -28700,6 +30894,9 @@ class AppearanceEditor(QDialog):
         self.current_elem = None
         self._populate_element_list()
         self.preview_canvas.refresh_layout()
+        if self.window:
+            self.window.apply_custom_layout()
+        self._mark_dirty()
 
     def move_element_up(self):
         row = self.element_list.currentRow()
@@ -28710,6 +30907,10 @@ class AppearanceEditor(QDialog):
         self.project.custom_layout = {k: layout[k] for k in keys}
         self._populate_element_list()
         self.element_list.setCurrentRow(row - 1)
+        self.preview_canvas.refresh_layout()
+        if self.window:
+            self.window.apply_custom_layout()
+        self._mark_dirty()
 
     def move_element_down(self):
         row = self.element_list.currentRow()
@@ -28720,6 +30921,10 @@ class AppearanceEditor(QDialog):
         self.project.custom_layout = {k: layout[k] for k in keys}
         self._populate_element_list()
         self.element_list.setCurrentRow(row + 1)
+        self.preview_canvas.refresh_layout()
+        if self.window:
+            self.window.apply_custom_layout()
+        self._mark_dirty()
 
     def _on_element_rows_moved(self, parent, start, end, dest, dest_row):
         new_keys = []
@@ -28899,6 +31104,153 @@ class AppearanceEditor(QDialog):
                 self._refresh_win_image_list()
                 self.win_combo_image.setCurrentText(filename)
 
+class WorkScheduleDialog(QDialog):
+    def __init__(self, app, schedule, parent=None):
+        super().__init__(parent)
+        self.app = app
+        self._period_rows = []
+        self._updating = False
+        self.setWindowTitle("工作日时段")
+        self.resize(520, 430)
+        try:
+            self.setStyleSheet(get_theme_qss(getattr(app, "theme", "light")))
+        except Exception:
+            pass
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("预设:"))
+        self.preset_combo = QComboBox()
+        for preset_id, preset in WORK_SCHEDULE_PRESETS.items():
+            self.preset_combo.addItem(preset["name"], preset_id)
+        self.preset_combo.addItem("自定义", "custom")
+        preset_row.addWidget(self.preset_combo, 1)
+        self.chk_calendar = QCheckBox("使用中国法定节假日")
+        preset_row.addWidget(self.chk_calendar)
+        layout.addLayout(preset_row)
+        day_row = QHBoxLayout()
+        day_row.addWidget(QLabel("工作日:"))
+        self.day_checks = []
+        for index, name in enumerate(("一", "二", "三", "四", "五", "六", "日")):
+            check = QCheckBox(name)
+            self.day_checks.append(check)
+            day_row.addWidget(check)
+        day_row.addStretch()
+        layout.addLayout(day_row)
+        self.periods_layout = QVBoxLayout()
+        self.periods_layout.setSpacing(3)
+        layout.addLayout(self.periods_layout)
+        btn_row = QHBoxLayout()
+        btn_add = QPushButton("添加时间段")
+        btn_add.clicked.connect(lambda: self._add_row("09:00", "18:00"))
+        btn_row.addWidget(btn_add)
+        self.daily_label = QLabel("")
+        btn_row.addWidget(self.daily_label, 1)
+        layout.addLayout(btn_row)
+        action_row = QHBoxLayout()
+        action_row.addStretch()
+        btn_cancel = QPushButton("取消")
+        btn_cancel.clicked.connect(self.reject)
+        btn_ok = QPushButton("确定")
+        btn_ok.setProperty("primary", True)
+        btn_ok.clicked.connect(self.accept)
+        action_row.addWidget(btn_cancel)
+        action_row.addWidget(btn_ok)
+        layout.addLayout(action_row)
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        self._load(schedule)
+
+    def _load(self, schedule):
+        self._updating = True
+        data = normalize_work_schedule(schedule, _default_work_schedule())
+        index = self.preset_combo.findData(data.get("preset") or "custom")
+        self.preset_combo.setCurrentIndex(index if index >= 0 else self.preset_combo.count() - 1)
+        self.chk_calendar.setChecked(bool(data.get("use_chinese_calendar")))
+        workdays = set(data.get("workdays") or [])
+        for day_index, check in enumerate(self.day_checks):
+            check.setChecked(day_index in workdays)
+        self._clear_rows()
+        for period in data.get("periods") or []:
+            self._add_row(period.get("start", "09:00"), period.get("end", "18:00"))
+        self._refresh_daily()
+        self._updating = False
+
+    def _clear_rows(self):
+        for row in self._period_rows:
+            try:
+                row.deleteLater()
+            except Exception:
+                pass
+        self._period_rows = []
+
+    def _add_row(self, start, end):
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        start_edit = QLineEdit(start)
+        start_edit.setFixedWidth(72)
+        end_edit = QLineEdit(end)
+        end_edit.setFixedWidth(72)
+        start_edit.textChanged.connect(self._refresh_daily)
+        end_edit.textChanged.connect(self._refresh_daily)
+        btn_remove = QPushButton("删除")
+        btn_remove.setFixedHeight(24)
+        btn_remove.clicked.connect(lambda _checked=False, r=row: self._remove_row(r))
+        lay.addWidget(QLabel("从"))
+        lay.addWidget(start_edit)
+        lay.addWidget(QLabel("到"))
+        lay.addWidget(end_edit)
+        lay.addWidget(btn_remove)
+        lay.addStretch()
+        row._start_edit = start_edit
+        row._end_edit = end_edit
+        self.periods_layout.addWidget(row)
+        self._period_rows.append(row)
+        self._refresh_daily()
+        return row
+
+    def _remove_row(self, row):
+        if len(self._period_rows) <= 1:
+            return
+        try:
+            self._period_rows.remove(row)
+            row.deleteLater()
+        except Exception:
+            pass
+        self._refresh_daily()
+
+    def _on_preset_changed(self, _index):
+        if self._updating:
+            return
+        preset = self.preset_combo.currentData()
+        if preset in WORK_SCHEDULE_PRESETS:
+            data = {**WORK_SCHEDULE_PRESETS[preset], "preset": preset}
+            self._load(data)
+
+    def _current_schedule(self):
+        workdays = [index for index, check in enumerate(self.day_checks) if check.isChecked()]
+        periods = []
+        for row in self._period_rows:
+            periods.append({"start": row._start_edit.text().strip(),
+                            "end": row._end_edit.text().strip()})
+        return normalize_work_schedule({
+            "preset": self.preset_combo.currentData() or "custom",
+            "use_chinese_calendar": self.chk_calendar.isChecked(),
+            "workdays": workdays,
+            "periods": periods,
+        }, _default_work_schedule())
+
+    def _refresh_daily(self, *_args):
+        if not hasattr(self, "daily_label"):
+            return
+        seconds = schedule_daily_seconds(self._current_schedule())
+        self.daily_label.setText(f"每工作日 {seconds / 3600.0:.1f} 小时")
+
+    def result_schedule(self):
+        return self._current_schedule()
+
+
 class ProjectEditorDialog(QDialog):
     def __init__(self, app, project, parent=None):
         super().__init__(parent)
@@ -28906,8 +31258,8 @@ class ProjectEditorDialog(QDialog):
         self.project = project
         self.setStyleSheet(get_theme_qss(self.app.theme))
         self.setWindowTitle(tr("edit_project") + f" - {project.name}")
-        self.setMinimumSize(460, 360)
-        self.resize(500, 460)
+        self.setMinimumSize(520, 620)
+        self.resize(560, 700)
         _pgeo = self.screen().availableGeometry()
         self.move(_pgeo.x() + (_pgeo.width() - self.width()) // 2,
                   _pgeo.y() + (_pgeo.height() - self.height()) // 2)
@@ -28925,12 +31277,14 @@ class ProjectEditorDialog(QDialog):
                 color: {tc['text_color']};
                 font-weight: bold; font-size: 13px;
                 border: 1px solid {tc['border_color']};
-                border-radius: 8px; margin-top: 10px; padding: 14px 10px 10px 10px;
+                border-radius: 8px; margin-top: 10px;
             }}
             QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 6px; }}
         """)
         form = QFormLayout(grp)
         form.setSpacing(10)
+        form.setContentsMargins(14, 22, 14, 14)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         self.edit_name = QLineEdit(self.project.name)
         self.edit_name.setMinimumHeight(32)
@@ -28945,7 +31299,7 @@ class ProjectEditorDialog(QDialog):
         self.edit_date.setPlaceholderText("YYYY-MM-DD")
         self.edit_date.setMinimumHeight(32)
         self.edit_date.setStyleSheet(f"border-radius: 5px; padding: 4px 8px;")
-        date_layout.addWidget(self.edit_date)
+        date_layout.addWidget(self.edit_date, 1)
 
         btn_cal = QPushButton()
         btn_cal.setIcon(app_icon('fa5s.calendar', color=tc['text_color']))
@@ -28980,11 +31334,48 @@ class ProjectEditorDialog(QDialog):
         time_layout.addWidget(self.edit_time)
         form.addRow(tr("target_time") + ":", time_layout)
 
+        self.start_date_edit = QLineEdit(getattr(self.project, "start_date", ""))
+        self.start_date_edit.setMinimumHeight(32)
+        self.start_date_edit.setPlaceholderText("YYYY-MM-DD")
+        self.start_date_edit.setToolTip("用于显示已过天数；留空则不显示")
+        form.addRow("起始日期:", self.start_date_edit)
+
+        self._project_work_schedule = (dict(self.project.work_schedule_override)
+                                       if isinstance(getattr(self.project, "work_schedule_override", None), dict)
+                                       else None)
+        work_row = QHBoxLayout()
+        work_row.setSpacing(6)
+        self.combo_work_override = QComboBox()
+        self.combo_work_override.addItem("跟随全局", "")
+        for _preset_id, _preset in WORK_SCHEDULE_PRESETS.items():
+            self.combo_work_override.addItem(_preset["name"], _preset_id)
+        self.combo_work_override.addItem("自定义", "custom")
+        self._sync_work_override_combo()
+        self.combo_work_override.currentIndexChanged.connect(self._on_work_override_changed)
+        work_row.addWidget(self.combo_work_override, 1)
+        btn_work_edit = QPushButton("编辑")
+        btn_work_edit.setFixedHeight(28)
+        btn_work_edit.clicked.connect(self._edit_project_work_schedule)
+        work_row.addWidget(btn_work_edit)
+        self.lbl_work_override = QLabel("")
+        self.lbl_work_override.setStyleSheet("color: gray; font-size: 10px;")
+        form.addRow("工作日时段:", work_row)
+        form.addRow("", self.lbl_work_override)
+        self._refresh_work_override_label()
+
+        self.combo_renderer = QComboBox()
+        self.combo_renderer.addItem("内置滚动数字", "builtin.rolling")
+        for _renderer_id, _renderer in (self.app.plugin_manager.plugin_renderers or {}).items():
+            self.combo_renderer.addItem(f"插件 · {_renderer.get('name') or _renderer_id}", _renderer_id)
+        _renderer_index = self.combo_renderer.findData(getattr(self.project, "renderer_id", "builtin.rolling"))
+        self.combo_renderer.setCurrentIndex(_renderer_index if _renderer_index >= 0 else 0)
+        form.addRow("倒计时渲染器:", self.combo_renderer)
+
         self.chk_show_both = QCheckBox(tr("show_both"))
         self.chk_show_both.setChecked(self.project.show_both)
         self.chk_show_both.setToolTip("同时显示已过天数和剩余天数")
         self.show_both_label = QLabel("")
-        form.addRow(self.show_both_label, self.chk_show_both)
+        form.addRow(self.chk_show_both)
 
         self.chk_end_sound = QCheckBox("结束提示音")
         self.chk_end_sound.setChecked(getattr(self.project, 'enable_end_sound', True))
@@ -29011,9 +31402,7 @@ class ProjectEditorDialog(QDialog):
 
         sound_row.addWidget(self.combo_end_sound_mode, 1)
         sound_row.addWidget(self.btn_browse_sound)
-        form.addRow(self.chk_end_sound, sound_row)
 
-        # 根据当前音效模式显示对应名称
         cur_mode = getattr(self.project, 'end_sound_mode', 'windchime')
         _mode_names = {"windchime": "风铃(柔和)", "piano": "钢琴", "double_ding": "叮叮(双频)",
                        "urgent_beep": "哔哔哔(急促)", "long_buzz": "嘟——(长音)",
@@ -29024,7 +31413,16 @@ class ProjectEditorDialog(QDialog):
             _init_label_text = f"{getattr(self.project, 'custom_sound_path', '')}"
         self._custom_sound_label = QLabel(_init_label_text)
         self._custom_sound_label.setStyleSheet(f"color: {tc['secondary_text']}; font-size: 11px;")
-        form.addRow("", self._custom_sound_label)
+        self._custom_sound_label.setVisible(cur_mode == "custom")
+
+        sound_box = QWidget()
+        sound_box_layout = QVBoxLayout(sound_box)
+        sound_box_layout.setContentsMargins(0, 0, 0, 0)
+        sound_box_layout.setSpacing(6)
+        sound_box_layout.addWidget(self.chk_end_sound)
+        sound_box_layout.addLayout(sound_row)
+        sound_box_layout.addWidget(self._custom_sound_label)
+        form.addRow(sound_box)
 
         type_layout = QHBoxLayout()
         type_layout.setSpacing(8)
@@ -29041,6 +31439,14 @@ class ProjectEditorDialog(QDialog):
         self.combo_project_type.setMinimumHeight(32)
         self.combo_project_type.currentIndexChanged.connect(self._on_project_type_changed)
         form.addRow(tr("project_type") + ":", self.combo_project_type)
+
+        self.type_settings_box = QGroupBox("类型设置")
+        self.type_form = QFormLayout(self.type_settings_box)
+        self.type_form.setSpacing(6)
+        self._type_field_widgets = []
+        form.addRow(self.type_settings_box)
+        self._refresh_type_settings(current_type)
+
         self.date_widget.setVisible(not is_recurring)
         self.date_label.setVisible(not is_recurring)
         self.chk_show_both.setVisible(not is_recurring)
@@ -29143,9 +31549,184 @@ class ProjectEditorDialog(QDialog):
         btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_save.clicked.connect(self.save_project)
         main_layout.addWidget(btn_save)
+        QTimer.singleShot(0, lambda: self.app._mount_plugin_ui_slots(self, "project_editor"))
+
+    def _clear_type_settings(self):
+        self._type_field_widgets = []
+        self._custom_type_editor = None
+        while self.type_form.rowCount():
+            self.type_form.removeRow(0)
+
+    def _refresh_type_settings(self, type_id):
+        if not hasattr(self, "type_form"):
+            return
+        self._clear_type_settings()
+        info = (self.app.plugin_manager.project_type_items() or {}).get(type_id)
+        schema = info.get("schema") if isinstance(info, dict) else None
+        editor_factory = info.get("editor") if isinstance(info, dict) else None
+        if not schema and not callable(editor_factory):
+            self.type_settings_box.setVisible(False)
+            return
+        plugin_data = getattr(self.project, "plugin_data", {}) or {}
+        entry = plugin_data.get(type_id) if isinstance(plugin_data, dict) else None
+        values = entry.get("values") if isinstance(entry, dict) else None
+        values = values if isinstance(values, dict) else {}
+        defaults = info.get("defaults") if isinstance(info.get("defaults"), dict) else {}
+        if callable(editor_factory):
+            try:
+                custom_editor = editor_factory(self.type_settings_box)
+                if isinstance(custom_editor, QWidget):
+                    self.type_form.addRow(custom_editor)
+                    self._custom_type_editor = custom_editor
+            except Exception as e:
+                log_message(f"[插件] 项目类型 {type_id} 自定义编辑器创建失败: {e}", "ERROR")
+        for spec in (schema or []):
+            if not isinstance(spec, dict):
+                continue
+            key = str(spec.get("key") or spec.get("name") or "").strip()
+            if not key:
+                continue
+            label = str(spec.get("label") or key)
+            field_type = str(spec.get("type") or "text").lower()
+            value = values.get(key, spec.get("default", defaults.get(key, "")))
+            if field_type == "bool":
+                widget = QCheckBox()
+                widget.setChecked(bool(value))
+            elif field_type == "int":
+                widget = QSpinBox()
+                widget.setRange(int(spec.get("min", -2147483648)), int(spec.get("max", 2147483647)))
+                try:
+                    widget.setValue(int(value))
+                except (TypeError, ValueError):
+                    widget.setValue(int(spec.get("default", 0) or 0))
+            elif field_type == "float":
+                widget = QDoubleSpinBox()
+                widget.setDecimals(int(spec.get("decimals", 2)))
+                widget.setRange(float(spec.get("min", -1e9)), float(spec.get("max", 1e9)))
+                try:
+                    widget.setValue(float(value))
+                except (TypeError, ValueError):
+                    widget.setValue(float(spec.get("default", 0) or 0))
+            elif field_type in ("select", "choice"):
+                widget = QComboBox()
+                choices = spec.get("choices") if isinstance(spec.get("choices"), list) else []
+                for choice in choices:
+                    if isinstance(choice, dict):
+                        widget.addItem(str(choice.get("label") or choice.get("value")), choice.get("value"))
+                    else:
+                        widget.addItem(str(choice), choice)
+                index = widget.findData(value)
+                if index < 0:
+                    index = widget.findText(str(value))
+                if index >= 0:
+                    widget.setCurrentIndex(index)
+            elif field_type in ("multiline", "json"):
+                widget = QPlainTextEdit()
+                widget.setFixedHeight(72)
+                if field_type == "json" and not isinstance(value, str):
+                    widget.setPlainText(json.dumps(value, ensure_ascii=False, indent=2))
+                else:
+                    widget.setPlainText(str(value or ""))
+            else:
+                widget = QLineEdit(str(value or ""))
+                if field_type in ("date", "time", "color"):
+                    widget.setPlaceholderText({"date": "YYYY-MM-DD", "time": "HH:MM",
+                                               "color": "#RRGGBB"}.get(field_type, ""))
+            self.type_form.addRow(label + ":", widget)
+            self._type_field_widgets.append((key, widget, field_type))
+        self.type_settings_box.setVisible(bool(self._type_field_widgets) or self._custom_type_editor is not None)
+
+    def _collect_type_values(self):
+        values = {}
+        for key, widget, field_type in self._type_field_widgets:
+            if field_type == "bool":
+                values[key] = widget.isChecked()
+            elif field_type == "int":
+                values[key] = int(widget.value())
+            elif field_type == "float":
+                values[key] = float(widget.value())
+            elif field_type in ("select", "choice"):
+                values[key] = widget.currentData()
+            elif field_type in ("multiline", "json"):
+                text = widget.toPlainText()
+                if field_type == "json":
+                    try:
+                        values[key] = json.loads(text) if text.strip() else None
+                    except Exception:
+                        raise ValueError(f"字段 {key} 不是合法 JSON")
+                else:
+                    values[key] = text
+            else:
+                values[key] = widget.text().strip()
+        custom_editor = getattr(self, "_custom_type_editor", None)
+        if custom_editor is not None and callable(getattr(custom_editor, "values", None)):
+            try:
+                extra = custom_editor.values()
+                if isinstance(extra, dict):
+                    values.update(extra)
+            except Exception as e:
+                log_message(f"[插件] 自定义项目类型编辑器取值失败: {e}", "ERROR")
+        return values
+
+    def _current_project_schedule(self):
+        if self._project_work_schedule is None:
+            return normalize_work_schedule(getattr(self.app, "work_schedule", None),
+                                           _default_work_schedule())
+        return normalize_work_schedule(self._project_work_schedule, _default_work_schedule())
+
+    def _sync_work_override_combo(self):
+        if not hasattr(self, "combo_work_override"):
+            return
+        self.combo_work_override.blockSignals(True)
+        if self._project_work_schedule is None:
+            index = 0
+        else:
+            data = normalize_work_schedule(self._project_work_schedule, _default_work_schedule())
+            index = self.combo_work_override.findData(data.get("preset") or "custom")
+            if index <= 0:
+                index = self.combo_work_override.findData("custom")
+        self.combo_work_override.setCurrentIndex(max(0, index))
+        self.combo_work_override.blockSignals(False)
+
+    def _on_work_override_changed(self, index):
+        key = self.combo_work_override.itemData(index)
+        if not key:
+            self._project_work_schedule = None
+        elif key in WORK_SCHEDULE_PRESETS:
+            self._project_work_schedule = {**WORK_SCHEDULE_PRESETS[key], "preset": key}
+        else:
+            if self._project_work_schedule is None:
+                self._project_work_schedule = normalize_work_schedule(
+                    getattr(self.app, "work_schedule", None), _default_work_schedule())
+        self._refresh_work_override_label()
+
+    def _edit_project_work_schedule(self):
+        dialog = WorkScheduleDialog(self.app, self._current_project_schedule(), self)
+        if dialog.exec():
+            self._project_work_schedule = dialog.result_schedule()
+            index = self.combo_work_override.findData("custom")
+            self.combo_work_override.blockSignals(True)
+            self.combo_work_override.setCurrentIndex(max(0, index))
+            self.combo_work_override.blockSignals(False)
+            self._refresh_work_override_label()
+
+    def _refresh_work_override_label(self):
+        if not hasattr(self, "lbl_work_override"):
+            return
+        data = self._current_project_schedule()
+        seconds = schedule_daily_seconds(data)
+        prefix = "跟随全局" if self._project_work_schedule is None else "自定义"
+        self.lbl_work_override.setText(f"{prefix} · {seconds / 3600.0:.1f}h/天")
 
     def _on_project_type_changed(self, index):
-        is_recurring = (self.combo_project_type.itemData(index) == "recurring")
+        type_id = self.combo_project_type.itemData(index) or "normal"
+        self._refresh_type_settings(type_id)
+        info = (self.app.plugin_manager.project_type_items() or {}).get(type_id)
+        if isinstance(info, dict) and info.get("renderer"):
+            renderer_index = self.combo_renderer.findData(info.get("renderer"))
+            if renderer_index >= 0:
+                self.combo_renderer.setCurrentIndex(renderer_index)
+        is_recurring = (type_id == "recurring")
         self.recur_box.setVisible(is_recurring)
         self.date_widget.setVisible(not is_recurring)
         self.date_label.setVisible(not is_recurring)
@@ -29255,6 +31836,7 @@ class ProjectEditorDialog(QDialog):
             if cust:
                 txt = f"{cust}"
         self._custom_sound_label.setText(txt)
+        self._custom_sound_label.setVisible(index == 8)
 
     def _play_or_browse_sound(self):
         idx = self.combo_end_sound_mode.currentIndex()
@@ -29310,11 +31892,20 @@ class ProjectEditorDialog(QDialog):
         if self.chk_exact_time.isChecked() and not validate_time(time_str):
             QMessageBox.critical(self, "错误", "时间格式无效！请使用 HH:MM")
             return
+        start_date_text = self.start_date_edit.text().strip()
+        if start_date_text and not validate_date(start_date_text):
+            QMessageBox.critical(self, "错误", "起始日期格式无效！请使用 YYYY-MM-DD")
+            return
 
         self.project.name = self.edit_name.text().strip()
         if not is_recurring:
             self.project.target_date = date_str
         self.project.target_time = time_str
+        self.project.start_date = start_date_text
+        self.project.renderer_id = self.combo_renderer.currentData() or "builtin.rolling"
+        self.project.work_schedule_override = (dict(self._project_work_schedule)
+                                               if isinstance(self._project_work_schedule, dict)
+                                               else None)
         self.project.show_both = self.chk_show_both.isChecked()
 
         self.project.enable_end_sound = self.chk_end_sound.isChecked()
@@ -29348,6 +31939,20 @@ class ProjectEditorDialog(QDialog):
             self.project.recur_weekdays = []
             self.project.recur_end_date = ""
 
+        if type_id not in ("normal", "recurring"):
+            info = (self.app.plugin_manager.project_type_items() or {}).get(type_id)
+            if isinstance(info, dict) and info.get("schema"):
+                try:
+                    values = self._collect_type_values()
+                except ValueError as exc:
+                    QMessageBox.critical(self, "错误", str(exc))
+                    return
+                self.project.plugin_data[type_id] = {
+                    "version": int(info.get("version") or 1),
+                    "values": values,
+                }
+                self.project.type_version = int(info.get("version") or 1)
+
         try:
             hook = self.app.plugin_manager.emit_hook("project_save", {
                 "project": self.project.to_dict(),
@@ -29368,6 +31973,287 @@ class ProjectEditorDialog(QDialog):
             if win.project == self.project:
                 win.refresh()
         self.accept()
+
+
+class ProjectOverviewCard(QFrame):
+    def __init__(self, project, index, app, parent=None):
+        super().__init__(parent)
+        self.project = project
+        self.index = index
+        self.app = app
+        self.setObjectName("overviewCard")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(158)
+        self.setMaximumHeight(176)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 13, 16, 12)
+        layout.setSpacing(6)
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        self.dot_label = QLabel("●")
+        self.dot_label.setObjectName("overviewDot")
+        self.name_label = QLabel(project.name)
+        self.name_label.setObjectName("overviewName")
+        self.badge_label = QLabel("")
+        self.badge_label.setObjectName("overviewBadge")
+        head.addWidget(self.dot_label)
+        head.addWidget(self.name_label, 1)
+        head.addWidget(self.badge_label)
+        self.value_label = QLabel("")
+        self.value_label.setObjectName("overviewValue")
+        self.value_label.setWordWrap(False)
+        self.static_label = QLabel("")
+        self.static_label.setObjectName("overviewStatic")
+        self.static_label.setWordWrap(False)
+        self.progress = QProgressBar()
+        self.progress.setObjectName("overviewProgress")
+        self.progress.setRange(0, 1000)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(5)
+        self.meta_label = QLabel("")
+        self.meta_label.setObjectName("overviewMeta")
+        self.meta_label.setWordWrap(False)
+        layout.addLayout(head)
+        layout.addWidget(self.value_label)
+        layout.addWidget(self.static_label)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.meta_label)
+        layout.addStretch()
+
+    def update_snapshot(self, snapshot):
+        self.value_label.setText(snapshot.display_text or "已到期")
+        self.static_label.setText(snapshot.static_text or "")
+        state = "normal"
+        if snapshot.expired:
+            state = "expired"
+        elif str(getattr(self.project, "display_format", "")) == "countup":
+            state = "countup"
+        elif str(getattr(self.project, "project_type", "normal")) == "recurring":
+            state = "recurring"
+        badge_text = {"normal": "进行中", "expired": "已到期",
+                      "countup": "正计时", "recurring": "循环"}[state]
+        self.badge_label.setText(badge_text)
+        for widget, prop in ((self.badge_label, state), (self.progress, state)):
+            if widget.property("state") != prop:
+                widget.setProperty("state", prop)
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
+        pct = None
+        try:
+            start_text = str(getattr(self.project, "start_date", "") or "").strip()
+            if start_text and snapshot.target is not None:
+                start_dt = datetime.strptime(start_text, "%Y-%m-%d")
+                total = (snapshot.target - start_dt).total_seconds()
+                if total > 0:
+                    now_dt = snapshot.now or app_now()
+                    pct = int(max(0.0, min(1.0, (now_dt - start_dt).total_seconds() / total)) * 1000)
+        except Exception:
+            pct = None
+        if snapshot.expired:
+            pct = 1000
+        if pct is None:
+            self.progress.hide()
+        else:
+            self.progress.show()
+            self.progress.setValue(pct)
+        target_text = ""
+        if snapshot.target is not None:
+            target_text = snapshot.target.strftime("%Y-%m-%d %H:%M")
+        elif getattr(self.project, "target_date", ""):
+            target_text = f"{self.project.target_date} {getattr(self.project, 'target_time', '00:00')}"
+        work_text = ""
+        if snapshot.daily_hours > 0:
+            work_text = f" · 每工作日 {snapshot.daily_hours:.1f}h"
+        self.meta_label.setText(f"{target_text}{work_text}")
+        self._fit_value()
+
+    def _fit_value(self):
+        text = self.value_label.text()
+        available = max(80, self.width() - 48)
+        size = 27
+        while size > 12:
+            probe = QFont(self.value_label.font())
+            probe.setPixelSize(size)
+            if QFontMetrics(probe).horizontalAdvance(text) <= available:
+                break
+            size -= 1
+        self.value_label.setStyleSheet(f"font-size: {size}px; background: transparent;")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "value_label"):
+            self._fit_value()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.app is not None:
+            self.app.focus_project_window(self.index)
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if self.app is not None:
+            self.app.edit_project_at(self.index)
+        super().mouseDoubleClickEvent(event)
+
+
+class GlobalOverviewWindow(QWidget):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self._cards = []
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setWindowTitle("全局视图")
+        self.resize(1080, 700)
+        self.setMinimumSize(680, 480)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 18, 22, 18)
+        root.setSpacing(14)
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        head_text = QVBoxLayout()
+        head_text.setSpacing(2)
+        self.title_label = QLabel("全局视图")
+        self.title_label.setObjectName("overviewTitle")
+        self.subtitle_label = QLabel("所有倒计时的实时概览")
+        self.subtitle_label.setObjectName("overviewSubtitle")
+        head_text.addWidget(self.title_label)
+        head_text.addWidget(self.subtitle_label)
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("overviewCount")
+        header.addLayout(head_text)
+        header.addStretch()
+        header.addWidget(self.count_label)
+        root.addLayout(header)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.container = QWidget()
+        self.grid = QGridLayout(self.container)
+        self.grid.setContentsMargins(0, 4, 0, 4)
+        self.grid.setSpacing(14)
+        self.grid.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.scroll.setWidget(self.container)
+        root.addWidget(self.scroll, 1)
+        self.timer = QTimer(self)
+        self.timer.setInterval(1000)
+        self.timer.timeout.connect(self._tick)
+        self.refresh_theme()
+        self.refresh_cards()
+        self.timer.start()
+
+    def refresh_theme(self):
+        theme = getattr(self.app, "theme", None)
+        if not isinstance(theme, Theme):
+            theme = get_system_theme()
+        tc = get_theme_colors(theme)
+        self.setStyleSheet(f"""
+            QWidget {{ background-color: {tc['bg_color']}; color: {tc['text_color']}; font-family: "Microsoft YaHei"; }}
+            QScrollArea, QScrollArea > QWidget > QWidget {{ background-color: {tc['bg_color']}; border: none; }}
+            QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
+            QScrollBar::handle:vertical {{ background: {tc['border_color']}; border-radius: 4px; min-height: 30px; }}
+            QScrollBar::handle:vertical:hover {{ background: {tc['secondary_text']}; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+            QLabel#overviewTitle {{ font-size: 22px; font-weight: 700; color: {tc['text_color']}; background: transparent; }}
+            QLabel#overviewSubtitle {{ font-size: 12px; color: {tc['secondary_text']}; background: transparent; }}
+            QLabel#overviewCount {{
+                font-size: 11px; font-weight: 600; color: {tc['text_color']};
+                background-color: {tc['panel_bg']}; border: 1px solid {tc['border_color']};
+                border-radius: 11px; padding: 4px 12px;
+            }}
+            QLabel#overviewEmpty {{
+                font-size: 13px; color: {tc['secondary_text']}; background: transparent;
+                padding: 60px 20px;
+            }}
+            QFrame#overviewCard {{
+                background-color: {tc['panel_bg']};
+                border: 1px solid {tc['border_color']};
+                border-radius: 14px;
+            }}
+            QFrame#overviewCard:hover {{
+                border-color: {tc['accent']};
+                background-color: {tc['alternate_bg']};
+            }}
+            QLabel#overviewDot {{ color: {tc['accent']}; font-size: 10px; background: transparent; }}
+            QLabel#overviewName {{ font-size: 15px; font-weight: 600; color: {tc['text_color']}; background: transparent; }}
+            QLabel#overviewBadge {{
+                font-size: 10px; font-weight: 600; color: {tc['accent']};
+                background-color: rgba(251,191,36,0.12); border-radius: 8px; padding: 2px 8px;
+            }}
+            QLabel#overviewBadge[state="expired"] {{ color: {tc['danger']}; background-color: rgba(244,63,94,0.14); }}
+            QLabel#overviewBadge[state="countup"] {{ color: {tc['blue']}; background-color: rgba(52,152,219,0.14); }}
+            QLabel#overviewBadge[state="recurring"] {{ color: {tc['success']}; background-color: rgba(52,211,153,0.14); }}
+            QLabel#overviewValue {{ font-size: 27px; font-weight: 700; color: {tc['accent']}; background: transparent; }}
+            QLabel#overviewStatic {{ font-size: 11px; color: {tc['secondary_text']}; background: transparent; }}
+            QLabel#overviewMeta {{ font-size: 10px; color: {tc['secondary_text']}; background: transparent; }}
+            QProgressBar#overviewProgress {{ background-color: {tc['border_color']}; border: none; border-radius: 2px; }}
+            QProgressBar#overviewProgress::chunk {{ background-color: {tc['accent']}; border-radius: 2px; }}
+            QProgressBar#overviewProgress[state="expired"]::chunk {{ background-color: {tc['danger']}; }}
+            QProgressBar#overviewProgress[state="countup"]::chunk {{ background-color: {tc['blue']}; }}
+            QProgressBar#overviewProgress[state="recurring"]::chunk {{ background-color: {tc['success']}; }}
+        """)
+
+    def _columns_for_width(self):
+        width = self.scroll.viewport().width() if hasattr(self, "scroll") else self.width()
+        if width >= 1020:
+            return 3
+        if width >= 660:
+            return 2
+        return 1
+
+    def refresh_cards(self):
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                widget.deleteLater()
+        self._cards = []
+        projects = list(getattr(self.app, "projects", []) or [])
+        self.count_label.setText(f"{len(projects)} 个项目")
+        if not projects:
+            empty = QLabel("还没有项目。右键悬浮窗 → 设置 → 项目管理，创建第一个倒计时。")
+            empty.setObjectName("overviewEmpty")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty.setWordWrap(True)
+            self.grid.addWidget(empty, 0, 0, 1, 3)
+        columns = self._columns_for_width()
+        for index, project in enumerate(projects):
+            card = ProjectOverviewCard(project, index, self.app, self.container)
+            self.grid.addWidget(card, index // columns, index % columns)
+            self._cards.append(card)
+        for column in range(3):
+            self.grid.setColumnStretch(column, 1 if column < columns else 0)
+        self._tick()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not hasattr(self, "_last_columns"):
+            self._last_columns = self._columns_for_width()
+            return
+        columns = self._columns_for_width()
+        if columns != self._last_columns:
+            self._last_columns = columns
+            QTimer.singleShot(0, self.refresh_cards)
+
+    def _tick(self):
+        for card in list(self._cards):
+            try:
+                snapshot = compute_countdown_snapshot(card.project, app=self.app)
+                card.update_snapshot(snapshot)
+            except Exception:
+                continue
+
+    def showEvent(self, event):
+        self.refresh_theme()
+        self.refresh_cards()
+        self.app._mount_plugin_ui_slots(self, "global_overview")
+        super().showEvent(event)
+
+    def closeEvent(self, event):
+        self.timer.stop()
+        if getattr(self.app, "overview_window", None) is self:
+            self.app.overview_window = None
+        super().closeEvent(event)
 
 
 class WeatherDebugDialog(QDialog):
@@ -31617,12 +34503,12 @@ class HelpTab(QWidget):
                 _help_mix(tc['panel_bg'], tc['accent'], 0.06),
                 _help_mix(tc['border_color'], tc['accent'], 0.17))
 
-    def _help_section(self, number, title, tc):
+    def _help_section(self, title, tc):
         return (
             f'<table cellspacing="0" cellpadding="0" width="100%"><tr>'
             f'<td width="3" bgcolor="{tc["accent"]}"></td>'
             f'<td style="padding-left:10px;"><span style="font-size:16px; font-weight:bold; color:{tc["text_color"]};">'
-            f'<span style="color:{tc["accent"]};">{number}</span>&nbsp;&nbsp;{title}</span></td>'
+            f'{title}</span></td>'
             f'</tr></table>'
         )
 
@@ -31685,7 +34571,6 @@ class HelpTab(QWidget):
                 f'border-left:3px solid {warn}; padding:8px 12px;">{note}</div>'
             )
         body = blocks[:head_index] + blocks[head_index + 1:] if head_index is not None else blocks
-        number = 0
         prev_tag = None
         first_body = True
         for block in body:
@@ -31698,8 +34583,7 @@ class HelpTab(QWidget):
             if parts:
                 parts.append("<br><br>" if first_body else "<br>")
             if tag in ("h1", "h2", "h3"):
-                number += 1
-                parts.append(self._help_section(f"{number:02d}", _help_plain(block), tc))
+                parts.append(self._help_section(_help_plain(block), tc))
             elif tag in ("ul", "ol"):
                 inner = _help_inner(block, tag)
                 inner = f'<{tag} style="margin-top:0px; margin-bottom:0px; margin-left:18px;">{inner}</{tag}>'
@@ -34473,6 +37357,18 @@ class SystemTrayIcon(QObject):
         act_settings.triggered.connect(self.master.open_settings)
         self.menu.addAction(act_settings)
 
+        act_overview = QAction("全局视图", self)
+        act_overview.triggered.connect(self.master.open_global_overview)
+        self.menu.addAction(act_overview)
+
+        self.format_menu = self.menu.addMenu("显示格式")
+        for _label, _fmt in (("智能（自动）", "auto"), ("小数 (天)", "decimal"),
+                             ("整数 (天)", "integer"), ("天时分", "dhms"),
+                             ("时分秒", "hms"), ("正计时", "countup")):
+            _act = QAction(_label, self)
+            _act.triggered.connect(lambda checked=False, value=_fmt: self.apply_global_format(value))
+            self.format_menu.addAction(_act)
+
         act_show = QAction("显示所有窗口", self)
         act_show.triggered.connect(self.master.create_windows)
         self.menu.addAction(act_show)
@@ -34519,6 +37415,23 @@ class SystemTrayIcon(QObject):
     def toggle_click_through_all(self, enabled):
         for window in getattr(self.master, 'windows', []):
             window.set_click_through(enabled, save=True)
+
+    def apply_global_format(self, fmt):
+        for project in getattr(self.master, "projects", []):
+            project.display_format = fmt
+            if fmt == "dhms":
+                project.display_format_template = FORMAT_PRESET_DHM
+            elif fmt == "hms":
+                project.display_format_template = FORMAT_PRESET_HMS
+        self.master.default_display_format = fmt
+        self.master.save_config(force=True)
+        for window in getattr(self.master, "windows", []):
+            try:
+                window.refresh_styles()
+                window.update_ticking_countdown()
+            except Exception:
+                pass
+        self.master._refresh_overview()
 
     def _inject_plugin_actions(self):
         pm = getattr(self.master, 'plugin_manager', None)
@@ -34629,8 +37542,8 @@ class CountdownApp(QApplication):
         install_qt_translations()
         self.setQuitOnLastWindowClosed(False)
 
-        self.current_version = "4.5.5"
-        self.build_version = "20261112A"
+        self.current_version = "4.8.3"
+        self.build_version = "20261116"
         self.python_version = sys.version.split()[0]
         self.global_font = "Microsoft YaHei"
         self.current_theme = "system"
@@ -34647,9 +37560,12 @@ class CountdownApp(QApplication):
         self.plugin_settings_tabs = {}
         self.exam_mode_config = {}
         self.exam_mode_window = None
+        self.overview_window = None
 
         self.auto_start = False
         self.time_sync_enabled = True
+        self.work_schedule = _default_work_schedule()
+        self.default_display_format = "auto"
         self.last_save_time = 0
         self.poem_level = "junior"
         self.daily_poem = ""
@@ -34715,6 +37631,11 @@ class CountdownApp(QApplication):
 
         self.plugin_manager = PluginManager(self, load_immediately=False)
         QTimer.singleShot(1000, self._load_plugins_and_restore)
+        self._project_type_timer = QTimer(self)
+        self._project_type_timer.setInterval(60000)
+        self._project_type_timer.timeout.connect(self._refresh_project_type_states)
+        self._project_type_timer.start()
+        QTimer.singleShot(2500, self._refresh_project_type_states)
 
         self.tray_icon = SystemTrayIcon(self)
 
@@ -35045,6 +37966,12 @@ class CountdownApp(QApplication):
                 widget.update()
             except Exception:
                 pass
+        overview = getattr(self, "overview_window", None)
+        if overview is not None:
+            try:
+                overview.refresh_theme()
+            except Exception:
+                pass
         QTimer.singleShot(0, self._rebuild_settings_for_theme)
 
     def create_windows(self):
@@ -35063,6 +37990,13 @@ class CountdownApp(QApplication):
                         setattr(proj, key, value)
             except Exception:
                 pass
+            if getattr(proj, "project_type", "normal") not in ("normal", "recurring"):
+                try:
+                    type_state = self.plugin_manager.resolve_project_type(proj)
+                    proj.type_state = dict(type_state) if isinstance(type_state, dict) else {}
+                except Exception as e:
+                    log_message(f"解析项目类型失败: {e}", "ERROR")
+                    proj.type_state = {}
             win = CountdownWindow(self, proj, i)
             self.windows.append(win)
             win.show()
@@ -35071,6 +38005,125 @@ class CountdownApp(QApplication):
                 widget.show()
             except Exception:
                 pass
+
+    def open_global_overview(self):
+        try:
+            if self.overview_window is not None and self.overview_window.isVisible():
+                self.overview_window.raise_()
+                self.overview_window.activateWindow()
+                return
+        except RuntimeError:
+            self.overview_window = None
+        self.overview_window = GlobalOverviewWindow(self)
+        self.overview_window.show()
+
+    def _refresh_project_type_states(self):
+        manager = getattr(self, "plugin_manager", None)
+        if manager is None or getattr(self, "global_disable_all_plugins", True):
+            return
+        changed = False
+        for project in list(getattr(self, "projects", []) or []):
+            if getattr(project, "project_type", "normal") in ("normal", "recurring"):
+                continue
+            try:
+                state = manager.schedule_project_type(project)
+            except Exception:
+                state = None
+            if isinstance(state, dict):
+                project.type_state = state
+                changed = True
+        if not changed:
+            return
+        for win in getattr(self, "windows", []) or []:
+            try:
+                win.refresh()
+            except Exception:
+                pass
+        overview = getattr(self, "overview_window", None)
+        if overview is not None:
+            try:
+                overview._tick()
+            except Exception:
+                pass
+
+    def _refresh_overview(self):
+        overview = getattr(self, "overview_window", None)
+        if overview is None:
+            return
+        try:
+            overview.refresh_theme()
+            overview.refresh_cards()
+        except Exception:
+            pass
+
+    def _mount_plugin_ui_slots(self, host, target):
+        manager = getattr(self, "plugin_manager", None)
+        registry = getattr(manager, "plugin_ui_slots", {}) or {}
+        for widget in list(getattr(host, "_plugin_ui_slot_widgets", []) or []):
+            try:
+                widget.deleteLater()
+            except Exception:
+                pass
+        widgets = []
+        for slot_id, info in registry.items():
+            if info.get("target") != target:
+                continue
+            owner = str(info.get("plugin") or "")
+            if owner:
+                enabled = any(getattr(plugin, "name", "") == owner and getattr(plugin, "enabled", False)
+                              for plugin in getattr(manager, "plugins", []) or [])
+                if not enabled:
+                    continue
+            try:
+                widget = info["class"](host)
+            except Exception as e:
+                log_message(f"创建插槽 {slot_id} 失败: {e}", "ERROR")
+                continue
+            widget._ui_slot_info = info
+            widget.show()
+            widgets.append(widget)
+        host._plugin_ui_slot_widgets = widgets
+        self._layout_plugin_ui_slots(host, widgets)
+
+    def _layout_plugin_ui_slots(self, host, widgets):
+        if not widgets:
+            return
+        y = 12
+        for widget in widgets:
+            info = getattr(widget, "_ui_slot_info", {}) or {}
+            size = info.get("size") or [320, 120]
+            try:
+                width, height = max(40, int(size[0])), max(24, int(size[1]))
+            except Exception:
+                width, height = 320, 120
+            position = info.get("position") or "after"
+            if position == "before":
+                x = 12
+            elif position == "over":
+                x = max(0, (host.width() - width) // 2)
+                y = max(0, (host.height() - height) // 2)
+            else:
+                x = max(0, host.width() - width - 12)
+            widget.setGeometry(QRect(int(x), int(y), width, height))
+            widget.raise_()
+            y += height + 6
+
+    def focus_project_window(self, index):
+        if 0 <= index < len(getattr(self, "windows", [])):
+            win = self.windows[index]
+            win.show()
+            win.raise_()
+            win.activateWindow()
+
+    def edit_project_at(self, index):
+        if not (0 <= index < len(getattr(self, "projects", []))):
+            return
+        project = self.projects[index]
+        editor = ProjectEditorDialog(self, project, None)
+        if editor.exec():
+            self.create_windows()
+            self.save_config(force=True)
+            self._refresh_overview()
 
     def create_float_widgets(self):
         for win in self.float_widgets:
@@ -35363,7 +38416,7 @@ class CountdownApp(QApplication):
         screen_height = screen_geo.height()
 
         if dialog_type == "settings":
-            target_w, target_h = int(screen_width * 0.5), int(screen_height * 0.6)
+            target_w, target_h = int(screen_width * 0.58), int(screen_height * 0.72)
         elif dialog_type == "editor":
             target_w, target_h = int(screen_width * 0.6), int(screen_height * 0.7)
         elif dialog_type == "help":
@@ -35371,8 +38424,10 @@ class CountdownApp(QApplication):
         else:
             target_w, target_h = base_width, base_height
 
-        optimal_width = max(800, min(target_w, screen_width - 100))
-        optimal_height = max(600, min(target_h, screen_height - 100))
+        optimal_width = max(800 if dialog_type != "settings" else 960,
+                            min(target_w, screen_width - 100))
+        optimal_height = max(600 if dialog_type != "settings" else 640,
+                             min(target_h, screen_height - 100))
         return optimal_width, optimal_height
 
     def _auto_update_holidays(self):
@@ -35481,6 +38536,21 @@ class CountdownApp(QApplication):
                 if config_ver < 9:
                     config.setdefault("widget_instances", [])
                     log_message(f"配置已从 v{config_ver} 迁移到 v9（新增独立控件）", "INFO")
+                if config_ver < 10:
+                    config.setdefault("work_schedule", _default_work_schedule())
+                    config.setdefault("default_display_format", "auto")
+                    _today_text = datetime.now().strftime("%Y-%m-%d")
+                    for p in config.get("projects", []):
+                        _target_text = str(p.get("target_date") or "")
+                        p.setdefault("start_date", _target_text if _target_text and _target_text < _today_text else _today_text)
+                        p.setdefault("work_schedule_override", None)
+                    log_message(f"配置已从 v{config_ver} 迁移到 v10（新增工作日时段与全局视图）", "INFO")
+                if config_ver < 11:
+                    for p in config.get("projects", []):
+                        p.setdefault("plugin_data", {})
+                        p.setdefault("renderer_id", "builtin.rolling")
+                        p.setdefault("type_version", 1)
+                    log_message(f"配置已从 v{config_ver} 迁移到 v11（新增插件项目数据与渲染器）", "INFO")
                 _theme_mode = config.get("theme_mode", "system")
                 if _theme_mode not in ("system", "light", "dark"):
                     _theme_mode = "system"
@@ -35494,6 +38564,9 @@ class CountdownApp(QApplication):
                     _p.position = clamp_rect_into_screens(int(_x), int(_y), int(_p.size[0]), int(_p.size[1]))
                 self.auto_start = config.get("auto_start", False)
                 self.time_sync_enabled = config.get("time_sync_enabled", True)
+                self.work_schedule = normalize_work_schedule(config.get("work_schedule"),
+                                                             _default_work_schedule())
+                self.default_display_format = config.get("default_display_format", "auto")
                 self.poem_level = config.get("poem_level", "junior")
                 DEBUG_MODE = config.get("debug_mode", 3)
                 STATUS_MONITOR = config.get("status_monitor", False)
@@ -35582,6 +38655,7 @@ class CountdownApp(QApplication):
     def _resync_time(self):
         if self.time_sync_enabled:
             sync_network_time_async()
+            QTimer.singleShot(4500, self._refresh_after_time_sync)
 
     def _retry_time_sync(self):
         if not self.time_sync_enabled:
@@ -35589,6 +38663,15 @@ class CountdownApp(QApplication):
         if bool(time_sync_status().get("ok")):
             return
         sync_network_time_async()
+        QTimer.singleShot(4500, self._refresh_after_time_sync)
+
+    def _refresh_after_time_sync(self):
+        for win in getattr(self, "windows", []):
+            try:
+                win.update_ticking_countdown()
+            except Exception:
+                pass
+        self._refresh_overview()
 
     @staticmethod
     def _atomic_replace(src, dst, retries=4, delay=0.05):
@@ -35650,6 +38733,8 @@ class CountdownApp(QApplication):
             "config_version": SUPPORTED_CONFIG_VERSION,
             "auto_start": self.auto_start,
             "time_sync_enabled": self.time_sync_enabled,
+            "work_schedule": self.work_schedule,
+            "default_display_format": self.default_display_format,
             "poem_level": self.poem_level,
             "debug_mode": DEBUG_MODE,
             "status_monitor": STATUS_MONITOR,
@@ -36466,6 +39551,13 @@ class CountdownApp(QApplication):
             if hasattr(self, 'settings_dlg') and self.settings_dlg and self.settings_dlg.isVisible():
                 self.settings_dlg.raise_()
                 self.settings_dlg.activateWindow()
+                if tab == "help" and section:
+                    tabs_widget = getattr(self, "settings_tabs", None)
+                    help_widget = getattr(self, "tab_help", None)
+                    if tabs_widget is not None and help_widget is not None:
+                        tabs_widget.setCurrentWidget(help_widget)
+                    if help_widget is not None:
+                        QTimer.singleShot(60, lambda: help_widget.navigate_to(section))
                 return
         except RuntimeError:
             self.settings_dlg = None
@@ -36479,15 +39571,17 @@ class CountdownApp(QApplication):
         self.settings_dlg.setWindowTitle(tr("settings_title"))
         self.settings_dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
+        _opt_w, _opt_h = self.get_optimal_window_size(900, 650, "settings")
+        self.settings_dlg.setMinimumSize(860, 600)
         if self.settings_geometry:
             try:
                 self.settings_dlg.restoreGeometry(self.settings_geometry)
-            except:
-                w, h = self.get_optimal_window_size(900, 650, "settings")
-                self.settings_dlg.resize(w, h)
+                if self.settings_dlg.width() < 900 or self.settings_dlg.height() < 620:
+                    self.settings_dlg.resize(_opt_w, _opt_h)
+            except Exception:
+                self.settings_dlg.resize(_opt_w, _opt_h)
         else:
-            w, h = self.get_optimal_window_size(900, 650, "settings")
-            self.settings_dlg.resize(w, h)
+            self.settings_dlg.resize(_opt_w, _opt_h)
 
         outer_layout = QVBoxLayout(self.settings_dlg)
         outer_layout.setContentsMargins(0, 0, 0, 0)
@@ -36535,6 +39629,7 @@ class CountdownApp(QApplication):
         main_layout.setContentsMargins(12, 8, 12, 12)
         container_layout.addLayout(main_layout)
         outer_layout.addWidget(container)
+        QTimer.singleShot(0, lambda: self._mount_plugin_ui_slots(self.settings_dlg, "settings"))
 
         if hasattr(self, 'plugin_settings_tabs'):
             for tab_name, (widget_factory, enabled) in self.plugin_settings_tabs.items():
@@ -36618,6 +39713,15 @@ class CountdownApp(QApplication):
         btn_layout_proj.addWidget(btn_del)
         btn_layout_proj.addWidget(btn_custom)
         layout_proj.addLayout(btn_layout_proj)
+
+        btn_layout_overview = QHBoxLayout()
+        btn_overview = QPushButton("全局视图")
+        btn_overview.setProperty("secondary", True)
+        btn_overview.setMinimumHeight(32)
+        btn_overview.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_overview.clicked.connect(self.open_global_overview)
+        btn_layout_overview.addWidget(btn_overview)
+        layout_proj.addLayout(btn_layout_overview)
 
         btn_layout_widget = QHBoxLayout()
         btn_layout_widget.setSpacing(6)
@@ -36857,6 +39961,72 @@ class CountdownApp(QApplication):
         lay_basic.addLayout(theme_lay, 2, 0, 1, 2)
 
         layout_global.addWidget(grp_basic)
+
+        grp_work = QGroupBox("工作日与显示")
+        lay_work = QVBoxLayout(grp_work)
+        lay_work.setSpacing(8)
+
+        work_preset_row = QHBoxLayout()
+        work_preset_row.addWidget(QLabel("工作日预设:"))
+        self.combo_work_preset = QComboBox()
+        for _preset_id, _preset in WORK_SCHEDULE_PRESETS.items():
+            self.combo_work_preset.addItem(_preset["name"], _preset_id)
+        self.combo_work_preset.addItem("自定义", "custom")
+        self.combo_work_preset.currentIndexChanged.connect(self._on_work_preset_changed)
+        work_preset_row.addWidget(self.combo_work_preset, 1)
+        self.chk_work_calendar = QCheckBox("使用中国法定节假日")
+        self.chk_work_calendar.toggled.connect(self._on_work_schedule_changed)
+        work_preset_row.addWidget(self.chk_work_calendar)
+        lay_work.addLayout(work_preset_row)
+
+        work_day_row = QHBoxLayout()
+        work_day_row.addWidget(QLabel("工作日:"))
+        self.work_day_checks = []
+        for _day_index, _day_name in enumerate(("一", "二", "三", "四", "五", "六", "日")):
+            _chk = QCheckBox(_day_name)
+            _chk.toggled.connect(self._on_work_schedule_changed)
+            self.work_day_checks.append(_chk)
+            work_day_row.addWidget(_chk)
+        work_day_row.addStretch()
+        lay_work.addLayout(work_day_row)
+
+        self.work_periods_layout = QVBoxLayout()
+        self.work_periods_layout.setSpacing(4)
+        self.work_period_rows = []
+        lay_work.addLayout(self.work_periods_layout)
+
+        period_btn_row = QHBoxLayout()
+        btn_add_period = QPushButton("添加时间段")
+        btn_add_period.clicked.connect(lambda: self._add_work_period_row("09:00", "18:00"))
+        period_btn_row.addWidget(btn_add_period)
+        self.lbl_work_daily = QLabel("")
+        self.lbl_work_daily.setStyleSheet(f"color: {tc['secondary_text']}; font-size: 10px;")
+        period_btn_row.addWidget(self.lbl_work_daily, 1)
+        lay_work.addLayout(period_btn_row)
+
+        format_row = QHBoxLayout()
+        format_row.addWidget(QLabel("默认显示格式:"))
+        self.combo_default_format = QComboBox()
+        self.combo_default_format.addItem("智能（自动）", "auto")
+        self.combo_default_format.addItem("小数 (天)", "decimal")
+        self.combo_default_format.addItem("整数 (天)", "integer")
+        self.combo_default_format.addItem("天时分", "dhms")
+        self.combo_default_format.addItem("时分秒", "hms")
+        self.combo_default_format.addItem("正计时", "countup")
+        self.combo_default_format.addItem("自定义模板", "custom")
+        _fmt_idx = self.combo_default_format.findData(getattr(self, "default_display_format", "auto"))
+        self.combo_default_format.setCurrentIndex(_fmt_idx if _fmt_idx >= 0 else 0)
+        self.combo_default_format.currentIndexChanged.connect(self._on_default_format_changed)
+        format_row.addWidget(self.combo_default_format, 1)
+        btn_format_all = QPushButton("应用到所有项目")
+        btn_format_all.clicked.connect(self._apply_default_format_to_all)
+        format_row.addWidget(btn_format_all)
+        lay_work.addLayout(format_row)
+
+        layout_global.addWidget(grp_work)
+
+        self._updating_work_ui = False
+        self._refresh_work_schedule_ui(getattr(self, "work_schedule", None))
 
         # 天气API配置
         grp_weather = QGroupBox(tr("weather_source"))
@@ -37501,7 +40671,13 @@ class CountdownApp(QApplication):
         container.setGraphicsEffect(_open_effect)
         _open_effect.setOpacity(0.0)
         self.settings_dlg.show()
+        self.settings_dlg.raise_()
+        self.settings_dlg.activateWindow()
         self._animate_dialog_open(self.settings_dlg, _open_effect)
+        if tab == "help" and section:
+            QTimer.singleShot(180, lambda: (
+                self.settings_dlg.raise_() if self.settings_dlg else None,
+                self.settings_dlg.activateWindow() if self.settings_dlg else None))
 
         self._last_tab_idx = tabs.currentIndex()
         self._tab_overlay = None
@@ -37668,15 +40844,15 @@ class CountdownApp(QApplication):
                 self._plugins_paused_by_global = [p.name for p in self.plugin_manager.get_enabled_plugins()]
             except Exception:
                 self._plugins_paused_by_global = []
+            try:
+                self.plugin_manager.shutdown_host()
+            except Exception:
+                pass
             for plugin in list(self.plugin_manager.plugins):
                 try:
                     self.plugin_manager.disable_plugin(plugin)
                 except Exception:
                     pass
-            try:
-                self.plugin_manager.shutdown_host()
-            except Exception:
-                pass
             try:
                 self.refresh_plugin_float_widgets()
             except Exception:
@@ -37960,9 +41136,20 @@ class CountdownApp(QApplication):
         new_proj = CountdownProject(screen_width=geo.width(),
                                      screen_height=geo.height())
         new_proj.project_type = type_map.get(choice, "normal")
+        type_info = (self.plugin_manager.project_type_items() or {}).get(new_proj.project_type)
+        if isinstance(type_info, dict):
+            new_proj.plugin_data[new_proj.project_type] = {
+                "version": int(type_info.get("version") or 1),
+                "values": dict(type_info.get("defaults") or {}),
+            }
+            new_proj.type_version = int(type_info.get("version") or 1)
+            if type_info.get("renderer"):
+                new_proj.renderer_id = str(type_info.get("renderer"))
         classic = find_skin(self, SKIN_CLASSIC_ID)
         if classic:
             self.apply_skin_to_project(new_proj, classic, None, mode="system", persist=False)
+        else:
+            new_proj.display_format = getattr(self, "default_display_format", "auto")
         is_recurring = new_proj.project_type == "recurring"
         if is_recurring:
             new_proj.recur_weekdays = [0, 1, 2, 3, 4]
@@ -37975,6 +41162,7 @@ class CountdownApp(QApplication):
         self.list_proj.setCurrentRow(len(self.projects) - 1)
         self.create_windows()
         self.save_config(force=True)
+        self._refresh_overview()
         if new_proj.project_type != "normal":
             editor = ProjectEditorDialog(self, new_proj, self.settings_dlg)
             if editor.exec():
@@ -37982,6 +41170,7 @@ class CountdownApp(QApplication):
                 self._set_proj_item_icon(self.list_proj.item(len(self.projects) - 1), new_proj)
                 self.create_windows()
                 self.save_config(force=True)
+                self._refresh_overview()
 
     def edit_project_ui(self):
         row = self.list_proj.currentRow()
@@ -37993,6 +41182,7 @@ class CountdownApp(QApplication):
                 self._set_proj_item_icon(self.list_proj.item(row), proj)
                 self.create_windows()
                 self.save_config(force=True)
+                self._refresh_overview()
 
     def del_project_ui(self):
         row = self.list_proj.currentRow()
@@ -38019,6 +41209,7 @@ class CountdownApp(QApplication):
                     self._set_proj_item_icon(self.list_proj.item(i), self.projects[i])
             self.create_windows()
             self.save_config(force=True)
+            self._refresh_overview()
 
     def _refresh_plugin_weather_sources(self):
         combo = getattr(self, 'combo_weather_source', None)
@@ -38186,6 +41377,141 @@ class CountdownApp(QApplication):
         except Exception as e:
             QMessageBox.critical(self.settings_dlg, tr("warning"), f"{e}")
 
+    def _clear_work_period_rows(self):
+        for row in getattr(self, "work_period_rows", []):
+            try:
+                row.deleteLater()
+            except Exception:
+                pass
+        self.work_period_rows = []
+
+    def _add_work_period_row(self, start="09:00", end="18:00"):
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        start_edit = QLineEdit(start)
+        start_edit.setFixedWidth(72)
+        start_edit.setPlaceholderText("HH:MM")
+        end_edit = QLineEdit(end)
+        end_edit.setFixedWidth(72)
+        end_edit.setPlaceholderText("HH:MM")
+        start_edit.editingFinished.connect(self._on_work_schedule_changed)
+        end_edit.editingFinished.connect(self._on_work_schedule_changed)
+        btn_remove = QPushButton("删除")
+        btn_remove.setFixedHeight(24)
+        btn_remove.clicked.connect(lambda _checked=False, r=row: self._remove_work_period_row(r))
+        lay.addWidget(QLabel("从"))
+        lay.addWidget(start_edit)
+        lay.addWidget(QLabel("到"))
+        lay.addWidget(end_edit)
+        lay.addWidget(btn_remove)
+        lay.addStretch()
+        row._start_edit = start_edit
+        row._end_edit = end_edit
+        self.work_periods_layout.addWidget(row)
+        self.work_period_rows.append(row)
+        return row
+
+    def _remove_work_period_row(self, row):
+        if len(getattr(self, "work_period_rows", [])) <= 1:
+            return
+        try:
+            self.work_period_rows.remove(row)
+            row.deleteLater()
+        except Exception:
+            pass
+        self._on_work_schedule_changed()
+
+    def _refresh_work_schedule_ui(self, schedule):
+        if not hasattr(self, "combo_work_preset"):
+            return
+        self._updating_work_ui = True
+        data = normalize_work_schedule(schedule, _default_work_schedule())
+        preset = data.get("preset") or "custom"
+        index = self.combo_work_preset.findData(preset)
+        if index < 0:
+            index = self.combo_work_preset.count() - 1
+        self.combo_work_preset.setCurrentIndex(index)
+        self.chk_work_calendar.setChecked(bool(data.get("use_chinese_calendar")))
+        workdays = set(data.get("workdays") or [])
+        for day_index, check in enumerate(self.work_day_checks):
+            check.setChecked(day_index in workdays)
+        self._clear_work_period_rows()
+        for period in data.get("periods") or []:
+            self._add_work_period_row(period.get("start", "09:00"), period.get("end", "18:00"))
+        self._update_work_daily_label(data)
+        self._updating_work_ui = False
+
+    def _current_work_schedule_from_ui(self):
+        workdays = [index for index, check in enumerate(self.work_day_checks) if check.isChecked()]
+        periods = []
+        for row in getattr(self, "work_period_rows", []):
+            periods.append({
+                "start": row._start_edit.text().strip(),
+                "end": row._end_edit.text().strip(),
+            })
+        return normalize_work_schedule({
+            "preset": self.combo_work_preset.currentData() or "custom",
+            "use_chinese_calendar": self.chk_work_calendar.isChecked(),
+            "workdays": workdays,
+            "periods": periods,
+        }, _default_work_schedule())
+
+    def _update_work_daily_label(self, schedule=None):
+        data = schedule or self._current_work_schedule_from_ui()
+        seconds = schedule_daily_seconds(data)
+        if hasattr(self, "lbl_work_daily"):
+            self.lbl_work_daily.setText(f"每工作日 {seconds / 3600.0:.1f} 小时")
+
+    def _on_work_preset_changed(self, _index):
+        if getattr(self, "_updating_work_ui", False):
+            return
+        preset = self.combo_work_preset.currentData()
+        if preset in WORK_SCHEDULE_PRESETS:
+            data = {**WORK_SCHEDULE_PRESETS[preset], "preset": preset}
+            self._refresh_work_schedule_ui(data)
+        self._on_work_schedule_changed()
+
+    def _on_work_schedule_changed(self, *_args):
+        if getattr(self, "_updating_work_ui", False):
+            return
+        self.work_schedule = self._current_work_schedule_from_ui()
+        self._update_work_daily_label(self.work_schedule)
+        self.save_config(force=True)
+        for win in getattr(self, "windows", []):
+            try:
+                win.update_countdown()
+                win.update_ticking_countdown()
+            except Exception:
+                pass
+        overview = getattr(self, "overview_window", None)
+        if overview is not None:
+            try:
+                overview.refresh_cards()
+            except Exception:
+                pass
+
+    def _on_default_format_changed(self, _index):
+        self.default_display_format = self.combo_default_format.currentData() or "auto"
+        self.save_config(force=True)
+
+    def _apply_default_format_to_all(self):
+        fmt = self.combo_default_format.currentData() or "auto"
+        for project in getattr(self, "projects", []):
+            project.display_format = fmt
+            if fmt == "dhms":
+                project.display_format_template = FORMAT_PRESET_DHM
+            elif fmt == "hms":
+                project.display_format_template = FORMAT_PRESET_HMS
+        self.save_config(force=True)
+        for win in getattr(self, "windows", []):
+            try:
+                win.refresh_styles()
+                win.update_ticking_countdown()
+            except Exception:
+                pass
+
     def auto_save_global_settings(self, _=None):
         index = self.combo_poem.currentIndex()
         if index == 0:
@@ -38227,6 +41553,7 @@ class CountdownApp(QApplication):
             pass
         QTimer.singleShot(1800, self._refresh_time_sync_label)
         QTimer.singleShot(4500, self._refresh_time_sync_label)
+        QTimer.singleShot(4500, self._refresh_after_time_sync)
 
     def _refresh_time_sync_label(self):
         try:

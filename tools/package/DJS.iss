@@ -1,5 +1,5 @@
 ﻿#ifndef MyAppVersion
-  #define MyAppVersion "4.5.5"
+  #define MyAppVersion "4.8.3"
 #endif
 
 #define MyAppName "倒计时·DJS"
